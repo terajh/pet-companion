@@ -572,6 +572,13 @@ fn cmd_set_overlay_position(
         .unwrap_or(1.0);
     let (cx, cy) = clamp_overlay_position(&window, pet_scale, input.x, input.y);
     let _ = window.set_position(LogicalPosition::new(cx, cy));
+    // Log what NSWindow actually accepted.  macOS may clamp title-bar-visible
+    // even for borderless windows via setFrameTopLeftPoint:.
+    if let (Ok(phys), Ok(scale)) = (window.outer_position(), window.scale_factor()) {
+        let ax = (phys.x as f64 / scale).round() as i32;
+        let ay = (phys.y as f64 / scale).round() as i32;
+        eprintln!("[set_position] requested=({},{}) actual=({},{})", cx, cy, ax, ay);
+    }
     Ok(())
 }
 
