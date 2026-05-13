@@ -753,6 +753,11 @@ function OverlayApp() {
         return;
       }
       state.started = true;
+      // Flip backend → detached BEFORE the first set_position so the 750ms
+      // sync_overlay_window tick stops trying to re-anchor the overlay to the
+      // tracked Claude/Codex window, which would otherwise fight every move
+      // and produce visible flicker locking the pet in place.
+      call("cmd_mark_detached").catch(console.error);
     }
     state.pending = { sx: event.screenX, sy: event.screenY };
     if (state.rafId === null) {
