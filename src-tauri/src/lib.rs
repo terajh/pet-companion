@@ -2523,43 +2523,43 @@ fn clamp_overlay_position(
     let pet_center_x = x + center_offset_x;
     let pet_center_y = y + center_offset_y;
 
-    let mut chosen = &monitors[0];
-    let mut best_distance = i64::MAX;
-    for monitor in &monitors {
-        let (min_x, min_y, width, height) = logical_monitor_frame(monitor);
-        let max_x = min_x + width;
-        let max_y = min_y + height;
+    // Per-monitor clamping breaks on multi-monitor setups: if the user drags
+    // the pet across a monitor boundary, pet_center temporarily falls into a
+    // logical-coord gap between adjacent monitors (especially when scale
+    // factors differ — each monitor's physical position divided by its own
+    // scale produces non-contiguous logical frames).  The "closest monitor"
+    // fallback then yanks the pet back into the source monitor, capping the
+    // drag at that monitor's menu bar.
+    //
+    // Use the UNION bounding rect of every monitor's logical frame instead.
+    // This lets the pet traverse all monitors freely.  The trade-off is that
+    // in L-shaped arrangements the pet could enter a corner gap that isn't
+    // covered by any monitor — acceptable for now; users won't typically
+    // drag into a dead corner.
+    let frames: Vec<(i32, i32, i32, i32)> =
+        monitors.iter().map(logical_monitor_frame).collect();
+    let union_min_x = frames.iter().map(|f| f.0).min().unwrap_or(0);
+    let union_min_y = frames.iter().map(|f| f.1).min().unwrap_or(0);
+    let union_max_x = frames.iter().map(|f| f.0 + f.2).max().unwrap_or(0);
+    let union_max_y = frames.iter().map(|f| f.1 + f.3).max().unwrap_or(0);
 
-        if pet_center_x >= min_x
-            && pet_center_x <= max_x
-            && pet_center_y >= min_y
-            && pet_center_y <= max_y
-        {
-            chosen = monitor;
-            break;
-        }
-
-        let dx = (pet_center_x.clamp(min_x, max_x) - pet_center_x).unsigned_abs() as i64;
-        let dy = (pet_center_y.clamp(min_y, max_y) - pet_center_y).unsigned_abs() as i64;
-        let distance = dx * dx + dy * dy;
-        if distance < best_distance {
-            best_distance = distance;
-            chosen = monitor;
-        }
-    }
-
-    let (mon_x, mon_y, width, height) = logical_monitor_frame(chosen);
-
-    // Visual pet rect must stay inside the monitor.  On the top axis we drop
-    // PET_VISIBLE_PADDING so the pet can hug the bottom of the menu bar; menu
-    // bar height alone guards visibility.
-    let min_cx = mon_x + PET_VISIBLE_PADDING + half_w;
-    let max_cx = mon_x + width - PET_VISIBLE_PADDING - half_w;
-    let min_cy = mon_y + MACOS_MENU_BAR_HEIGHT + half_h;
-    let max_cy = mon_y + height - PET_VISIBLE_PADDING - half_h;
+    let min_cx = union_min_x + PET_VISIBLE_PADDING + half_w;
+    let max_cx = union_max_x - PET_VISIBLE_PADDING - half_w;
+    // Top axis drops PET_VISIBLE_PADDING so the pet can hug the menu bar.
+    // We assume the topmost monitor carries macOS's menu bar.
+    let min_cy = union_min_y + MACOS_MENU_BAR_HEIGHT + half_h;
+    let max_cy = union_max_y - PET_VISIBLE_PADDING - half_h;
 
     let clamped_cx = pet_center_x.clamp(min_cx, max_cx.max(min_cx));
     let clamped_cy = pet_center_y.clamp(min_cy, max_cy.max(min_cy));
+
+    eprintln!(
+        "[clamp] in=({},{}) center=({},{}) frames={:?} union=({},{},{},{}) bounds=cx[{}..{}] cy[{}..{}] -> out=({},{})",
+        x, y, pet_center_x, pet_center_y, frames,
+        union_min_x, union_min_y, union_max_x, union_max_y,
+        min_cx, max_cx, min_cy, max_cy,
+        clamped_cx - center_offset_x, clamped_cy - center_offset_y,
+    );
 
     (
         clamped_cx - center_offset_x,
