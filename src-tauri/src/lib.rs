@@ -643,6 +643,26 @@ unsafe fn set_window_origin_unconstrained(
     }
     let ns_window = ns_window_ptr as *mut Object;
 
+    // Diagnostic: verify ns_window is actually an NSWindow.  Logged once.
+    static LOGGED: std::sync::Once = std::sync::Once::new();
+    LOGGED.call_once(|| {
+        let cls: *mut Object = msg_send![ns_window, class];
+        let name_ptr: *const i8 = msg_send![cls, name];
+        if !name_ptr.is_null() {
+            let cstr = std::ffi::CStr::from_ptr(name_ptr);
+            eprintln!("[set_position] ns_window class = {:?}", cstr);
+        }
+        let cur_level: i64 = msg_send![ns_window, level];
+        eprintln!("[set_position] initial NSWindow level = {}", cur_level);
+    });
+
+    // Raise window level to NSStatusWindowLevel (25) so the window sits ABOVE
+    // the menu bar plane.  At lower levels (e.g. NSFloatingWindowLevel = 3
+    // which Tauri's alwaysOnTop sets), macOS WindowServer clamps window Y so
+    // the window can't be positioned beneath/over the menu bar — exactly the
+    // "actual=(_,34)" symptom we kept seeing even after setFrameOrigin:.
+    let _: () = msg_send![ns_window, setLevel: 25_i64];
+
     let frame: NSRect = msg_send![ns_window, frame];
     let window_height = frame.size.height;
 
