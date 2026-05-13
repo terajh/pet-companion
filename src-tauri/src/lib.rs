@@ -542,6 +542,65 @@ async fn cmd_focus_session_by_id(
     Ok(())
 }
 
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct OverlayPositionInput {
+    x: i32,
+    y: i32,
+}
+
+/// Fast-path drag step: clamps the requested logical position against the
+/// monitor + pet_scale visual rect and writes it via `set_position` without
+/// touching the model lock or persisting config.  Frontend calls this on every
+/// pointermove tick (rAF-throttled).  Persistence + refresh happen once at
+/// drag end via `cmd_finalize_drag_position`.
+#[tauri::command]
+fn cmd_set_overlay_position(
+    app: AppHandle,
+    state: State<'_, AppState>,
+    input: OverlayPositionInput,
+) -> Result<(), String> {
+    let Some(window) = app.get_webview_window(OVERLAY_WINDOW_LABEL) else {
+        return Err("overlay window missing".into());
+    };
+    // try_lock so a 750ms refresh tick holding the model never blocks the
+    // 60Hz drag stream; fall back to the persisted default (1.0) if busy.
+    let pet_scale = state
+        .model
+        .try_lock()
+        .map(|m| m.config.pet_scale)
+        .unwrap_or(1.0);
+    let (cx, cy) = clamp_overlay_position(&window, pet_scale, input.x, input.y);
+    let _ = window.set_position(LogicalPosition::new(cx, cy));
+    Ok(())
+}
+
+/// Drag end: persist final position, ensure detached=true, and trigger a
+/// refresh so the frontend updates `cardsBelow` for the new pet position.
+#[tauri::command]
+async fn cmd_finalize_drag_position(
+    app: AppHandle,
+    state: State<'_, AppState>,
+) -> Result<(), String> {
+    let Some(window) = app.get_webview_window(OVERLAY_WINDOW_LABEL) else {
+        return Ok(());
+    };
+    let scale = window.scale_factor().unwrap_or(1.0);
+    let Ok(physical) = window.outer_position() else {
+        return Ok(());
+    };
+    let lx = (physical.x as f64 / scale).round() as i32;
+    let ly = (physical.y as f64 / scale).round() as i32;
+
+    {
+        let mut model = state.model.lock().await;
+        model.config.detached = true;
+        model.config.detached_position = Some(SavedPosition { x: lx, y: ly });
+        persist_config(&state.config_path, &model.config)?;
+    }
+    refresh_and_emit(&app, &state).await
+}
+
 #[tauri::command]
 async fn cmd_mark_detached(app: AppHandle, state: State<'_, AppState>) -> Result<(), String> {
     {
@@ -679,56 +738,13 @@ pub fn run() {
                 api.prevent_close();
                 let _ = window.hide();
             }
-            WindowEvent::Moved(position) if window.label() == OVERLAY_WINDOW_LABEL => {
-                let app = window.app_handle().clone();
-                let scale = window.scale_factor().unwrap_or(1.0);
-                let x = (position.x as f64 / scale).round() as i32;
-                let y = (position.y as f64 / scale).round() as i32;
-                tauri::async_runtime::spawn(async move {
-                    let state = app.state::<AppState>();
-                    let mut model = state.model.lock().await;
-                    if model.config.detached {
-                        if let Some(overlay_window) = app.get_webview_window(OVERLAY_WINDOW_LABEL) {
-                            let (next_x, next_y) = clamp_overlay_position(&overlay_window, x, y);
-                            if next_x != x || next_y != y {
-                                let _ = overlay_window
-                                    .set_position(LogicalPosition::new(next_x, next_y));
-                            }
-                            model.config.detached_position =
-                                Some(SavedPosition { x: next_x, y: next_y });
-                        } else {
-                            model.config.detached_position = Some(SavedPosition { x, y });
-                        }
-                        let _ = persist_config(&state.config_path, &model.config);
-                    } else {
-                        // Not yet detached — check if this Moved event came from a user drag
-                        // rather than a programmatic set_position call.
-                        // sync_overlay_window records the last logical position it wrote into
-                        // expected_attached_position; if the new position diverges by more than
-                        // 6 logical pixels on either axis, treat it as a user-initiated drag and
-                        // transition to detached mode.  A ≤6 px delta is treated as a
-                        // programmatic echo and ignored, guarding against spurious detach on
-                        // single click.
-                        const DRAG_THRESHOLD: i32 = 6;
-                        let is_user_drag = model
-                            .expected_attached_position
-                            .map(|(ex, ey)| {
-                                (x - ex).abs() > DRAG_THRESHOLD || (y - ey).abs() > DRAG_THRESHOLD
-                            })
-                            .unwrap_or(false);
-
-                        if is_user_drag {
-                            model.config.detached = true;
-                            model.config.detached_position = Some(SavedPosition { x, y });
-                            let _ = persist_config(&state.config_path, &model.config);
-                            // Trigger a full refresh so the frontend learns about detached=true.
-                            let app2 = app.clone();
-                            let state2 = app2.state::<AppState>();
-                            drop(model);
-                            let _ = refresh_and_emit(&app2, &state2).await;
-                        }
-                    }
-                });
+            WindowEvent::Moved(_) if window.label() == OVERLAY_WINDOW_LABEL => {
+                // Drag is now wholly frontend-driven via `cmd_set_overlay_position` /
+                // `cmd_finalize_drag_position`.  This handler used to clamp on every
+                // OS-emitted Moved event, but with the manual drag the position is
+                // already clamped before set_position; the resulting Moved echo would
+                // race with subsequent moves and cause visible jitter.  Intentional
+                // no-op.
             }
             _ => {}
         })
@@ -759,7 +775,9 @@ pub fn run() {
         })
         .invoke_handler(tauri::generate_handler![
             cmd_begin_drag,
+            cmd_finalize_drag_position,
             cmd_mark_detached,
+            cmd_set_overlay_position,
             cmd_focus_active_session,
             cmd_focus_session_by_id,
             cmd_get_app_payload,
@@ -2242,16 +2260,18 @@ try {
 fn sync_overlay_window(
     app: &AppHandle,
     config: &mut PersistedConfig,
-    config_path: &Path,
+    _config_path: &Path,
     overlay: &OverlaySnapshot,
 ) -> Option<(i32, i32)> {
     let Some(window) = app.get_webview_window(OVERLAY_WINDOW_LABEL) else {
         return None;
     };
 
-    // When detached, just ensure the window is on-screen and return early.
+    // Detached mode: position is wholly user-controlled (set via
+    // cmd_set_overlay_position).  No automatic repositioning — what the user
+    // dragged stays where they dragged it, no surprise teleports.  The
+    // startup pass (position_overlay_at_startup) is the only safety net.
     if config.detached {
-        ensure_detached_overlay_visible(&window, config, config_path);
         return None;
     }
 
@@ -2276,7 +2296,7 @@ fn sync_overlay_window(
     {
         let x = current_window.x + current_window.width - OVERLAY_WIDTH - ATTACHED_MARGIN_X;
         let y = current_window.y + current_window.height - OVERLAY_HEIGHT - ATTACHED_MARGIN_Y;
-        let (next_x, next_y) = clamp_overlay_position(&window, x, y);
+        let (next_x, next_y) = clamp_overlay_position(&window, config.pet_scale, x, y);
         let _ = window.set_position(LogicalPosition::new(next_x, next_y));
         Some((next_x, next_y))
     } else {
@@ -2416,8 +2436,9 @@ fn position_overlay_at_startup(app: &mut tauri::App) {
 
     let state = app.state::<AppState>();
     let mut model = state.model.blocking_lock();
+    let pet_scale = model.config.pet_scale;
     if let Some(pos) = &model.config.detached_position {
-        let (next_x, next_y) = clamp_overlay_position(&window, pos.x, pos.y);
+        let (next_x, next_y) = clamp_overlay_position(&window, pet_scale, pos.x, pos.y);
         let _ = window.set_position(LogicalPosition::new(next_x, next_y));
         model.config.detached_position = Some(SavedPosition { x: next_x, y: next_y });
         let _ = persist_config(&state.config_path, &model.config);
@@ -2425,92 +2446,16 @@ fn position_overlay_at_startup(app: &mut tauri::App) {
     }
 
     if let Ok(Some(monitor)) = window.current_monitor() {
-        let size = monitor.size();
-        let position = monitor.position();
-        let x = position.x + size.width as i32 - OVERLAY_WIDTH - ATTACHED_MARGIN_X;
-        let y = position.y + size.height as i32 - OVERLAY_HEIGHT - ATTACHED_MARGIN_Y;
-        let (next_x, next_y) = clamp_overlay_position(&window, x, y);
+        let (mx, my, width, height) = logical_monitor_frame(&monitor);
+        let x = mx + width - OVERLAY_WIDTH - ATTACHED_MARGIN_X;
+        let y = my + height - OVERLAY_HEIGHT - ATTACHED_MARGIN_Y;
+        let (next_x, next_y) = clamp_overlay_position(&window, pet_scale, x, y);
         let _ = window.set_position(LogicalPosition::new(next_x, next_y));
     } else {
         // Startup — expected_attached_position will be written by the first
         // sync_overlay_window call; discard the return value here.
         let _ = move_overlay_to_safe_home(&window);
     }
-}
-
-/// Returns true if the overlay rect at (ox, oy) overlaps the monitor's
-/// logical work area by at least `min_overlap_px` on both axes.
-fn overlay_rect_visible_on_monitor(
-    overlay_xy: (i32, i32),
-    monitor: &tauri::Monitor,
-    min_overlap_px: i32,
-) -> bool {
-    let (ox, oy) = overlay_xy;
-    let (mx, my, mw, mh) = logical_monitor_frame(monitor);
-
-    // Check the pet rectangle (not the whole transparent window) since the
-    // upper portion is intentionally empty and may extend off-screen.
-    let pet_local_x = OVERLAY_WIDTH - PET_BOX_RIGHT - PET_BOX_WIDTH;
-    let pet_local_y = OVERLAY_HEIGHT - PET_BOX_BOTTOM - PET_BOX_HEIGHT;
-    let px = ox + pet_local_x;
-    let py = oy + pet_local_y;
-    let overlap_x = (px + PET_BOX_WIDTH).min(mx + mw) - px.max(mx);
-    let overlap_y = (py + PET_BOX_HEIGHT).min(my + mh) - py.max(my);
-    overlap_x >= min_overlap_px && overlap_y >= min_overlap_px
-}
-
-fn ensure_detached_overlay_visible(
-    window: &tauri::WebviewWindow,
-    config: &mut PersistedConfig,
-    config_path: &Path,
-) {
-    // Prefer the saved logical position from config (always logical coords).
-    // Fall back to outer_position() which returns *physical* pixels and must be
-    // converted to logical coords by dividing by the scale factor.
-    let current = if let Some(saved) = config.detached_position.as_ref() {
-        Some((saved.x, saved.y))
-    } else {
-        match window.outer_position() {
-            Ok(physical) => {
-                let scale = window.scale_factor().unwrap_or(1.0);
-                let lx = (physical.x as f64 / scale).round() as i32;
-                let ly = (physical.y as f64 / scale).round() as i32;
-                Some((lx, ly))
-            }
-            Err(_) => None,
-        }
-    };
-
-    let Some((x, y)) = current else {
-        // No known position — move to safe home so the window is always visible.
-        let (hx, hy) = safe_home_position(window);
-        let _ = window.set_position(LogicalPosition::new(hx, hy));
-        config.detached_position = Some(SavedPosition { x: hx, y: hy });
-        let _ = persist_config(config_path, config);
-        return;
-    };
-
-    // Only reposition when the window is substantially off-screen.
-    // If the overlay overlaps at least one monitor by ≥40 logical pixels on
-    // both axes, leave it exactly where it is — no set_position, no write.
-    const MIN_OVERLAP_PX: i32 = 40;
-    let visible_on_any = window
-        .available_monitors()
-        .ok()
-        .unwrap_or_default()
-        .iter()
-        .any(|m| overlay_rect_visible_on_monitor((x, y), m, MIN_OVERLAP_PX));
-
-    if visible_on_any {
-        // Position is fine — do nothing.
-        return;
-    }
-
-    // Window has drifted off all monitors; snap to safe home.
-    let (hx, hy) = safe_home_position(window);
-    let _ = window.set_position(LogicalPosition::new(hx, hy));
-    config.detached_position = Some(SavedPosition { x: hx, y: hy });
-    let _ = persist_config(config_path, config);
 }
 
 fn move_overlay_to_safe_home(window: &tauri::WebviewWindow) -> (i32, i32) {
@@ -2549,7 +2494,12 @@ fn safe_home_position(window: &tauri::WebviewWindow) -> (i32, i32) {
     (ATTACHED_MARGIN_X, ATTACHED_MARGIN_Y + MACOS_MENU_BAR_HEIGHT)
 }
 
-fn clamp_overlay_position(window: &tauri::WebviewWindow, x: i32, y: i32) -> (i32, i32) {
+fn clamp_overlay_position(
+    window: &tauri::WebviewWindow,
+    pet_scale: f32,
+    x: i32,
+    y: i32,
+) -> (i32, i32) {
     let Ok(monitors) = window.available_monitors() else {
         return (x, y);
     };
@@ -2557,13 +2507,21 @@ fn clamp_overlay_position(window: &tauri::WebviewWindow, x: i32, y: i32) -> (i32
         return (x, y);
     }
 
-    // Clamp by the pet rectangle (window-local), not the whole window, so the
-    // user can drag the pet to the menu bar even though the upper part of the
-    // 520×760 window is empty and would otherwise clip against the screen top.
+    // CSS `transform: scale()` grows the pet symmetrically around its center,
+    // so the visual rectangle widens by (scale-1) * size on each axis.  Clamp
+    // against the *visual* rectangle so the pet never clips off-screen at
+    // larger sprite sizes.
+    let pet_scale = pet_scale.clamp(0.5, 2.0);
+    let half_w = ((PET_BOX_WIDTH as f32 * pet_scale) * 0.5).round() as i32;
+    let half_h = ((PET_BOX_HEIGHT as f32 * pet_scale) * 0.5).round() as i32;
+
+    // Center of the pet sprite in screen coords.
     let pet_local_x = OVERLAY_WIDTH - PET_BOX_RIGHT - PET_BOX_WIDTH;
     let pet_local_y = OVERLAY_HEIGHT - PET_BOX_BOTTOM - PET_BOX_HEIGHT;
-    let pet_center_x = x + pet_local_x + PET_BOX_WIDTH / 2;
-    let pet_center_y = y + pet_local_y + PET_BOX_HEIGHT / 2;
+    let center_offset_x = pet_local_x + PET_BOX_WIDTH / 2;
+    let center_offset_y = pet_local_y + PET_BOX_HEIGHT / 2;
+    let pet_center_x = x + center_offset_x;
+    let pet_center_y = y + center_offset_y;
 
     let mut chosen = &monitors[0];
     let mut best_distance = i64::MAX;
@@ -2581,20 +2539,8 @@ fn clamp_overlay_position(window: &tauri::WebviewWindow, x: i32, y: i32) -> (i32
             break;
         }
 
-        let dx = if pet_center_x < min_x {
-            (min_x - pet_center_x) as i64
-        } else if pet_center_x > max_x {
-            (pet_center_x - max_x) as i64
-        } else {
-            0
-        };
-        let dy = if pet_center_y < min_y {
-            (min_y - pet_center_y) as i64
-        } else if pet_center_y > max_y {
-            (pet_center_y - max_y) as i64
-        } else {
-            0
-        };
+        let dx = (pet_center_x.clamp(min_x, max_x) - pet_center_x).unsigned_abs() as i64;
+        let dy = (pet_center_y.clamp(min_y, max_y) - pet_center_y).unsigned_abs() as i64;
         let distance = dx * dx + dy * dy;
         if distance < best_distance {
             best_distance = distance;
@@ -2604,17 +2550,21 @@ fn clamp_overlay_position(window: &tauri::WebviewWindow, x: i32, y: i32) -> (i32
 
     let (mon_x, mon_y, width, height) = logical_monitor_frame(chosen);
 
-    // The pet's top-left in screen coords is (x + pet_local_x, y + pet_local_y).
-    // Require pet rect to stay inside [monitor + padding, monitor + size - padding],
-    // with menu-bar guard on top. Solve for window x/y.
-    let min_x = mon_x + PET_VISIBLE_PADDING - pet_local_x;
-    let max_x = mon_x + width - PET_BOX_WIDTH - PET_VISIBLE_PADDING - pet_local_x;
-    let min_y = mon_y + MACOS_MENU_BAR_HEIGHT + PET_VISIBLE_PADDING - pet_local_y;
-    let max_y = mon_y + height - PET_BOX_HEIGHT - PET_VISIBLE_PADDING - pet_local_y;
+    // Visual pet rect must stay inside the monitor.  On the top axis we drop
+    // PET_VISIBLE_PADDING so the pet can hug the bottom of the menu bar; menu
+    // bar height alone guards visibility.
+    let min_cx = mon_x + PET_VISIBLE_PADDING + half_w;
+    let max_cx = mon_x + width - PET_VISIBLE_PADDING - half_w;
+    let min_cy = mon_y + MACOS_MENU_BAR_HEIGHT + half_h;
+    let max_cy = mon_y + height - PET_VISIBLE_PADDING - half_h;
 
-    let clamped_x = x.clamp(min_x, max_x.max(min_x));
-    let clamped_y = y.clamp(min_y, max_y.max(min_y));
-    (clamped_x, clamped_y)
+    let clamped_cx = pet_center_x.clamp(min_cx, max_cx.max(min_cx));
+    let clamped_cy = pet_center_y.clamp(min_cy, max_cy.max(min_cy));
+
+    (
+        clamped_cx - center_offset_x,
+        clamped_cy - center_offset_y,
+    )
 }
 
 fn logical_monitor_frame(monitor: &tauri::Monitor) -> (i32, i32, i32, i32) {

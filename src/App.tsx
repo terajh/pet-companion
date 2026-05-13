@@ -659,8 +659,26 @@ function OverlayApp() {
   const [menu, setMenu] = useState<ContextMenuState>(null);
   const [spriteLoaded, setSpriteLoaded] = useState(false);
   const [collapsed, setCollapsed] = useState(false);
-  const pointerStartRef = useRef<{ x: number; y: number } | null>(null);
-  const dragStartedRef = useRef(false);
+  // Drag state.  We replace `data-tauri-drag-region` (OS-driven drag) with a
+  // manual cursor-tracking drag because macOS's native window drag refuses to
+  // move the window above the menu bar — which prevents the pet (anchored at
+  // bottom-right of a 520×760 window) from reaching the top of the screen.
+  // The manual implementation calls `cmd_set_overlay_position(window_x,
+  // window_y)` on every pointermove (rAF-throttled), letting Rust clamp the
+  // logical window position against the active monitor's frame.
+  const dragStateRef = useRef<{
+    // Cursor offset within the overlay window at pointerdown (in logical
+    // CSS pixels).  Maintained throughout the drag so the pet stays anchored
+    // under the cursor.
+    grabOffsetX: number;
+    grabOffsetY: number;
+    // Initial cursor screen position (for click-vs-drag threshold).
+    startScreenX: number;
+    startScreenY: number;
+    started: boolean;
+    rafId: number | null;
+    pending: { sx: number; sy: number } | null;
+  } | null>(null);
   const strings = MESSAGES[payload.config.language];
 
   // Dynamic hit-test: transparent areas pass clicks through; interactive
@@ -689,37 +707,86 @@ function OverlayApp() {
     }
   };
 
-  // Drag is handled natively via `data-tauri-drag-region` on the pet shell —
-  // calling `start_dragging` from a pointermove handler doesn't work because
-  // by the time the IPC round-trips back to Rust the originating mousedown
-  // event is no longer in the macOS event queue.  We still detect a "real"
-  // drag vs a simple click in JS so we only fire the pet reaction on click.
+  const DRAG_THRESHOLD = 6;
+
+  const flushPendingMove = () => {
+    const state = dragStateRef.current;
+    if (!state || !state.pending) {
+      return;
+    }
+    const { sx, sy } = state.pending;
+    state.pending = null;
+    state.rafId = null;
+    // Convert cursor screen position → desired window top-left in logical
+    // pixels.  `screenX/Y` is logical CSS pixels with primary-monitor origin
+    // on macOS, which matches Tauri's `LogicalPosition` coord space.
+    const x = Math.round(sx - state.grabOffsetX);
+    const y = Math.round(sy - state.grabOffsetY);
+    call("cmd_set_overlay_position", { input: { x, y } }).catch(console.error);
+  };
+
   const handlePointerDown = (event: React.PointerEvent<HTMLDivElement>) => {
     if (event.button !== 0) {
       return;
     }
-    pointerStartRef.current = { x: event.clientX, y: event.clientY };
-    dragStartedRef.current = false;
+    event.currentTarget.setPointerCapture(event.pointerId);
+    dragStateRef.current = {
+      grabOffsetX: event.clientX,
+      grabOffsetY: event.clientY,
+      startScreenX: event.screenX,
+      startScreenY: event.screenY,
+      started: false,
+      rafId: null,
+      pending: null,
+    };
   };
 
   const handlePointerMove = (event: React.PointerEvent<HTMLDivElement>) => {
-    if (!pointerStartRef.current || dragStartedRef.current) {
+    const state = dragStateRef.current;
+    if (!state) {
       return;
     }
-    const dx = event.clientX - pointerStartRef.current.x;
-    const dy = event.clientY - pointerStartRef.current.y;
-    if (Math.hypot(dx, dy) >= 6) {
-      dragStartedRef.current = true;
+    if (!state.started) {
+      const dx = event.screenX - state.startScreenX;
+      const dy = event.screenY - state.startScreenY;
+      if (Math.hypot(dx, dy) < DRAG_THRESHOLD) {
+        return;
+      }
+      state.started = true;
+    }
+    state.pending = { sx: event.screenX, sy: event.screenY };
+    if (state.rafId === null) {
+      state.rafId = requestAnimationFrame(flushPendingMove);
     }
   };
 
-  const handlePointerUp = async () => {
-    if (!pointerStartRef.current) {
+  const handlePointerUp = async (event: React.PointerEvent<HTMLDivElement>) => {
+    const state = dragStateRef.current;
+    if (!state) {
       return;
     }
-    const wasDrag = dragStartedRef.current;
-    pointerStartRef.current = null;
-    dragStartedRef.current = false;
+    try {
+      event.currentTarget.releasePointerCapture(event.pointerId);
+    } catch {
+      /* ignore — capture may have been lost */
+    }
+    if (state.rafId !== null) {
+      cancelAnimationFrame(state.rafId);
+    }
+    // Apply any pending move synchronously so the final position lands
+    // before finalize.
+    if (state.pending) {
+      const { sx, sy } = state.pending;
+      const x = Math.round(sx - state.grabOffsetX);
+      const y = Math.round(sy - state.grabOffsetY);
+      try {
+        await call("cmd_set_overlay_position", { input: { x, y } });
+      } catch (error) {
+        console.error(error);
+      }
+    }
+    const wasDrag = state.started;
+    dragStateRef.current = null;
 
     if (!wasDrag) {
       try {
@@ -728,9 +795,10 @@ function OverlayApp() {
         console.error(error);
       }
     } else {
-      // The window moved; mark overlay as detached on the backend side.
+      // Persist final position + flip detached=true + refresh payload so the
+      // frontend recomputes `cardsBelow` for the new pet location.
       try {
-        await call("cmd_mark_detached");
+        await call("cmd_finalize_drag_position");
       } catch (error) {
         console.error(error);
       }
@@ -757,7 +825,6 @@ function OverlayApp() {
       ) : null}
       <div
         className={`pet-shell is-${payload.overlay.effectiveState}${spriteLoaded ? " is-loaded" : ""}`}
-        data-tauri-drag-region
         onDoubleClick={() => call("cmd_reattach_overlay").catch(console.error)}
         onPointerDown={handlePointerDown}
         onPointerMove={handlePointerMove}
@@ -770,7 +837,7 @@ function OverlayApp() {
         />
         <button
           className="pet-shell__collapse-btn"
-          data-tauri-drag-region="false"
+          onPointerDown={(e) => e.stopPropagation()}
           onClick={(e) => {
             e.stopPropagation();
             setCollapsed((prev) => !prev);
