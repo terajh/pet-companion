@@ -981,7 +981,19 @@ fn rebuild_payload(model: &mut RuntimeModel, config_path: &Path) -> Result<AppPa
             .insert(session.session_id.clone(), session.in_progress);
     }
 
-    let current_turn_completed = detect_turn_completion(model, active_session.as_ref());
+    let turn_just_completed = detect_turn_completion(model, active_session.as_ref());
+    // A turn is only "really" completed when the active session is not
+    // currently in progress.  Codex emits nested `task_complete` events for
+    // sub-tasks while the outer turn keeps running (in_progress=true); we
+    // must not treat those as completion, otherwise the label flips to
+    // "완료됨" while the assistant is still working.  Same guard applies to
+    // Claude: a new user turn that arrives within the same refresh tick
+    // should override the just-bumped assistant message count.
+    let active_in_progress = active_session
+        .as_ref()
+        .map(|s| s.in_progress)
+        .unwrap_or(false);
+    let current_turn_completed = turn_just_completed && !active_in_progress;
     let pet_resolution = resolve_pet_selection(&mut model.config, &codex_state)?;
     let base_state = compute_base_state(active_session.as_ref(), current_turn_completed);
 
@@ -1007,6 +1019,16 @@ fn rebuild_payload(model: &mut RuntimeModel, config_path: &Path) -> Result<AppPa
             state: PetAnimationState::Jumping,
             until: Instant::now() + Duration::from_millis(JUMPING_DURATION_MS),
         });
+    }
+    // If a Waving latch is still pending from a previous tick but the active
+    // session has re-entered in_progress, invalidate it so the label flips
+    // back to "진행 중" immediately instead of waiting out the 2s window.
+    if active_in_progress {
+        if let Some(latch) = &model.override_animation {
+            if matches!(latch.state, PetAnimationState::Waving) {
+                model.override_animation = None;
+            }
+        }
     }
     model.last_base_state = Some(map_base_state(base_state));
 
