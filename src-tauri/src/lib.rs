@@ -571,14 +571,81 @@ fn cmd_set_overlay_position(
         .map(|m| m.config.pet_scale)
         .unwrap_or(1.0);
     let (cx, cy) = clamp_overlay_position(&window, pet_scale, input.x, input.y);
-    let _ = window.set_position(LogicalPosition::new(cx, cy));
-    // Log what NSWindow actually accepted.  macOS may clamp title-bar-visible
-    // even for borderless windows via setFrameTopLeftPoint:.
+    // Tauri's set_position on macOS goes through NSWindow's
+    // setFrameTopLeftPoint:, which forces the title bar to remain on screen —
+    // even for borderless windows.  That snaps any y < ~34 back to y=34 and
+    // makes it impossible to drag the pet onto a monitor positioned above the
+    // primary.  Bypass via direct NSWindow setFrameOrigin:.
+    #[cfg(target_os = "macos")]
+    {
+        if unsafe { set_window_origin_unconstrained(&window, cx as f64, cy as f64) }.is_err() {
+            let _ = window.set_position(LogicalPosition::new(cx, cy));
+        }
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        let _ = window.set_position(LogicalPosition::new(cx, cy));
+    }
     if let (Ok(phys), Ok(scale)) = (window.outer_position(), window.scale_factor()) {
         let ax = (phys.x as f64 / scale).round() as i32;
         let ay = (phys.y as f64 / scale).round() as i32;
         eprintln!("[set_position] requested=({},{}) actual=({},{})", cx, cy, ax, ay);
     }
+    Ok(())
+}
+
+/// Direct NSWindow setFrameOrigin: call, bypassing macOS's title-bar-visible
+/// constraint that ships with setFrameTopLeftPoint:.
+///
+/// `logical_x` / `logical_y` are top-left coords with primary screen's
+/// top-left as origin and y growing downward — same convention Tauri uses for
+/// `LogicalPosition` on macOS.  Internally we convert to Cocoa's bottom-left
+/// origin where y grows upward.
+#[cfg(target_os = "macos")]
+unsafe fn set_window_origin_unconstrained(
+    window: &tauri::WebviewWindow,
+    logical_x: f64,
+    logical_y: f64,
+) -> Result<(), String> {
+    use objc::runtime::{Class, Object};
+    use objc::{class, msg_send, sel, sel_impl};
+
+    #[repr(C)]
+    #[derive(Copy, Clone)]
+    struct NSPoint { x: f64, y: f64 }
+    #[repr(C)]
+    #[derive(Copy, Clone)]
+    struct NSSize { width: f64, height: f64 }
+    #[repr(C)]
+    #[derive(Copy, Clone)]
+    struct NSRect { origin: NSPoint, size: NSSize }
+
+    let ns_window_ptr = window.ns_window().map_err(|e| e.to_string())?;
+    if ns_window_ptr.is_null() {
+        return Err("null ns_window".into());
+    }
+    let ns_window = ns_window_ptr as *mut Object;
+
+    let frame: NSRect = msg_send![ns_window, frame];
+    let window_height = frame.size.height;
+
+    let ns_screen: &Class = class!(NSScreen);
+    let screens: *mut Object = msg_send![ns_screen, screens];
+    let count: usize = msg_send![screens, count];
+    if count == 0 {
+        return Err("no screens".into());
+    }
+    let main_screen: *mut Object = msg_send![screens, objectAtIndex: 0_usize];
+    let main_frame: NSRect = msg_send![main_screen, frame];
+    let primary_height = main_frame.size.height;
+
+    // Cocoa origin = bottom-left of primary screen, y grows upward.
+    // logical_y measures the window top from primary's top, y growing down.
+    // window.frame.origin is the window's bottom-left in Cocoa coords:
+    //   cocoa_y = primary_height - logical_y - window_height
+    let cocoa_y = primary_height - logical_y - window_height;
+    let origin = NSPoint { x: logical_x, y: cocoa_y };
+    let _: () = msg_send![ns_window, setFrameOrigin: origin];
     Ok(())
 }
 
