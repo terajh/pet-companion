@@ -575,21 +575,38 @@ fn cmd_set_overlay_position(
     // setFrameTopLeftPoint:, which forces the title bar to remain on screen —
     // even for borderless windows.  That snaps any y < ~34 back to y=34 and
     // makes it impossible to drag the pet onto a monitor positioned above the
-    // primary.  Bypass via direct NSWindow setFrameOrigin:.
+    // primary.  Bypass via direct NSWindow setFrameOrigin: on the main thread
+    // (AppKit calls outside the main thread are silently dropped).
     #[cfg(target_os = "macos")]
     {
-        if unsafe { set_window_origin_unconstrained(&window, cx as f64, cy as f64) }.is_err() {
-            let _ = window.set_position(LogicalPosition::new(cx, cy));
-        }
+        let window_main = window.clone();
+        let cx_f = cx as f64;
+        let cy_f = cy as f64;
+        let _ = app.run_on_main_thread(move || {
+            let result = unsafe { set_window_origin_unconstrained(&window_main, cx_f, cy_f) };
+            match result {
+                Ok(()) => {
+                    if let (Ok(phys), Ok(scale)) =
+                        (window_main.outer_position(), window_main.scale_factor())
+                    {
+                        let ax = (phys.x as f64 / scale).round() as i32;
+                        let ay = (phys.y as f64 / scale).round() as i32;
+                        eprintln!(
+                            "[set_position] objc requested=({},{}) actual=({},{})",
+                            cx, cy, ax, ay
+                        );
+                    }
+                }
+                Err(e) => {
+                    eprintln!("[set_position] objc err: {} — falling back", e);
+                    let _ = window_main.set_position(LogicalPosition::new(cx, cy));
+                }
+            }
+        });
     }
     #[cfg(not(target_os = "macos"))]
     {
         let _ = window.set_position(LogicalPosition::new(cx, cy));
-    }
-    if let (Ok(phys), Ok(scale)) = (window.outer_position(), window.scale_factor()) {
-        let ax = (phys.x as f64 / scale).round() as i32;
-        let ay = (phys.y as f64 / scale).round() as i32;
-        eprintln!("[set_position] requested=({},{}) actual=({},{})", cx, cy, ax, ay);
     }
     Ok(())
 }
