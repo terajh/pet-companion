@@ -378,14 +378,19 @@ const MAX_VISIBLE_CARDS = 6;
 function pickVisibleSessions(payload: AppPayload): SessionSummary[] {
   const dismissed = new Set(payload.overlay.dismissedSessionIds);
   const completedRuntime = new Set(payload.overlay.completedRuntimeSessionIds);
+  const activeId = payload.overlay.activeSession?.sessionId ?? null;
 
   // Visibility policy:
-  //   • in_progress (running / waiting): always show
+  //   • the currently tracked active session: always show (the user perceives
+  //     the conversation they are chatting with as "in progress" even when
+  //     the agent is idle between turns)
+  //   • other sessions that are in_progress (running / waiting): show
   //   • runtime-completed (was in_progress true → false during this app
   //     session) AND not dismissed: show with "완료" label
-  //   • everything else (idle past sessions, dismissed cards): hidden
+  //   • everything else (other idle sessions, dismissed cards): hidden
   const candidates = payload.overlay.sessions.filter((session) => {
     if (session.isArchived) return false;
+    if (session.sessionId === activeId && !dismissed.has(session.sessionId)) return true;
     if (session.inProgress) return true;
     if (dismissed.has(session.sessionId)) return false;
     return completedRuntime.has(session.sessionId);
