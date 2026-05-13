@@ -1,7 +1,8 @@
 #!/bin/bash
 set -e
 
-APP_NAME="mac-timer"
+APP_NAME="Pet Companion"
+ZIP_NAME="Pet-Companion"
 
 # ── 버전 결정 ──────────────────────────────────────
 PKG_VERSION=$(node -p "require('./package.json').version")
@@ -44,7 +45,7 @@ pnpm tauri build
 bash scripts/post-build.sh
 
 DIST_DIR="src-tauri/target/release/bundle/dist"
-ZIP_PATH="$DIST_DIR/${APP_NAME}.zip"
+ZIP_PATH="$DIST_DIR/${ZIP_NAME}.zip"
 
 # ── 커밋 + 태그 + 푸시 ────────────────────────────
 git add package.json src-tauri/tauri.conf.json src-tauri/Cargo.toml src-tauri/Cargo.lock
@@ -56,7 +57,7 @@ echo "🏷️  태그 v$VERSION 푸시 완료"
 
 # ── 릴리즈 노트 ────────────────────────────────────
 PREVIOUS_TAG="$LATEST_TAG"
-NOTES_FILE=$(mktemp "/tmp/${APP_NAME}-release-notes.XXXXXX.md")
+NOTES_FILE=$(mktemp "/tmp/pet-companion-release-notes.XXXXXX.md")
 
 if [ -n "$PREVIOUS_TAG" ]; then
   CHANGE_HINTS=$(git log --no-merges --pretty=format:'- %s' "$PREVIOUS_TAG..HEAD")
@@ -69,8 +70,9 @@ cat > "$NOTES_FILE" <<EOF
 $CHANGE_HINTS
 
 ## 설치
-1. 첨부된 \`${APP_NAME}.zip\` 다운로드 후 압축 해제
+1. 첨부된 \`${ZIP_NAME}.zip\` 다운로드 후 압축 해제
 2. 폴더 안의 \`install.command\` 더블클릭 → Terminal이 열리며 자동 설치
+3. 첫 실행 시 macOS가 차단하면 시스템 설정 → 개인정보 보호 및 보안에서 "그래도 열기" 선택
 EOF
 
 # ── GitHub 릴리즈 ──────────────────────────────────
