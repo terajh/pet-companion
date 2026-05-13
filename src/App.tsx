@@ -57,6 +57,7 @@ const STATE_ROWS: Record<
   { frames: number; fps: number; row: number }
 > = {
   idle: { row: 0, frames: 6, fps: 3 },
+  sleeping: { row: 1, frames: 6, fps: 2 },
   running: { row: 7, frames: 6, fps: 7 },
   waiting: { row: 6, frames: 6, fps: 2 },
   waving: { row: 3, frames: 4, fps: 6 },
@@ -193,6 +194,7 @@ function stateLabel(state: PetAnimationState, language: "en" | "ko"): string {
       jumping: "Updating",
       review: "Review",
       running: "In progress",
+      sleeping: "Sleeping",
       waiting: "Still working",
       waving: "Completed",
     },
@@ -202,6 +204,7 @@ function stateLabel(state: PetAnimationState, language: "en" | "ko"): string {
       jumping: "갱신 중",
       review: "검토",
       running: "진행 중",
+      sleeping: "자는 중",
       waiting: "계속 진행 중",
       waving: "완료됨",
     },

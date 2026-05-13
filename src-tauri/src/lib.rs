@@ -63,6 +63,7 @@ impl Default for SessionApp {
 #[serde(rename_all = "lowercase")]
 enum PetAnimationState {
     Idle,
+    Sleeping,
     Running,
     Waiting,
     Waving,
@@ -1018,6 +1019,15 @@ fn rebuild_payload(model: &mut RuntimeModel, config_path: &Path) -> Result<AppPa
         }
     } else {
         map_base_state(base_state)
+    };
+    // When the pet would otherwise be Idle and no session anywhere is
+    // running/waiting, swap to the Sleeping animation so the overlay looks
+    // peaceful instead of static.
+    let any_in_progress = sessions.iter().any(|s| s.in_progress);
+    let effective_state = if effective_state == PetAnimationState::Idle && !any_in_progress {
+        PetAnimationState::Sleeping
+    } else {
+        effective_state
     };
     let owner_frontmost = active_session
         .as_ref()
