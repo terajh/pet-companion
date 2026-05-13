@@ -15,6 +15,19 @@ body,
   background: transparent;
 }
 
+/* Overlay 창은 절대로 스크롤바를 노출하면 안 된다. transparent 창에 native
+   scrollbar가 그려지면 회색 트랙이 그대로 보여서 깨진 화면처럼 인식된다.
+   Settings 창은 .settings-root가 자체 overflow-y:auto로 스크롤을 담당하므로,
+   여기서 html/body에 overflow:hidden을 걸어도 안전하다. */
+html,
+body {
+  overflow: hidden;
+}
+
+.settings-root {
+  overflow-y: auto;
+}
+
 button,
 input,
 select {
@@ -138,6 +151,16 @@ select {
   width: min(280px, calc(100vw - 28px));
   max-width: calc(100vw - 28px);
   pointer-events: none;
+}
+
+/* Flipped variant: when the pet sits near the top of the screen the cards
+   above the pet would clip off-screen (the overlay window itself is fixed at
+   520×760 and the upper portion is off-screen).  Re-anchor the stack to the
+   bottom-left of the window so the first (most-recent) card is guaranteed to
+   render next to the pet on the user-visible portion of the window. */
+.overlay-card-stack--below {
+  bottom: 16px;
+  right: calc(28px + 112px * var(--pet-scale, 1) + 12px);
 }
 
 .overlay-card-stack > * {
@@ -317,7 +340,12 @@ select {
 }
 
 .settings-root {
-  min-height: 100vh;
+  /* Settings 창에서 스크롤은 .settings-root가 책임진다. html/body는 overlay 창
+     보호를 위해 overflow:hidden이라 부모 스크롤이 불가능하므로, 이 엘리먼트의
+     높이를 viewport에 고정해야 콘텐츠가 자기 안에서 스크롤된다.
+     min-height: 100vh로 두면 콘텐츠만큼 커져서 자기 overflow가 trigger되지 않고
+     부모 overflow:hidden에 잘린다. */
+  height: 100vh;
   padding: 16px;
   background: #0c0f14;
   color: #eef2f7;

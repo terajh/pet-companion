@@ -56,6 +56,8 @@ export interface OverlaySnapshot {
   showCard: boolean;
   stateLabel: string;
   dismissedSessionIds: string[];
+  completedRuntimeSessionIds: string[];
+  cardsBelow: boolean;
 }
 
 export interface AppPayload {

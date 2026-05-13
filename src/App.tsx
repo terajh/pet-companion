@@ -46,6 +46,8 @@ const INITIAL_PAYLOAD: AppPayload = {
     showCard: false,
     stateLabel: "Idle",
     dismissedSessionIds: [],
+    completedRuntimeSessionIds: [],
+    cardsBelow: false,
   },
   pets: [],
 };
@@ -357,12 +359,10 @@ function PetSprite({
       className="pet-sprite"
       style={{
         backgroundImage: `url("${sheet.src}")`,
-        backgroundSize: `${canonicalW}px ${canonicalH}px`,
-        backgroundPosition: `-${frame * SPRITE_WIDTH}px -${spec.row * SPRITE_HEIGHT}px`,
-        width: `${SPRITE_WIDTH}px`,
-        height: `${SPRITE_HEIGHT}px`,
-        transform: "scale(var(--pet-scale, 1))",
-        transformOrigin: "bottom right",
+        backgroundSize: `calc(${canonicalW}px * var(--pet-scale, 1)) calc(${canonicalH}px * var(--pet-scale, 1))`,
+        backgroundPosition: `calc(${-frame * SPRITE_WIDTH}px * var(--pet-scale, 1)) calc(${-spec.row * SPRITE_HEIGHT}px * var(--pet-scale, 1))`,
+        width: `calc(${SPRITE_WIDTH}px * var(--pet-scale, 1))`,
+        height: `calc(${SPRITE_HEIGHT}px * var(--pet-scale, 1))`,
       }}
       aria-label={`${pet.displayName} ${state}`}
       role="img"
@@ -374,26 +374,21 @@ const MAX_VISIBLE_CARDS = 6;
 
 function pickVisibleSessions(payload: AppPayload): SessionSummary[] {
   const dismissed = new Set(payload.overlay.dismissedSessionIds);
+  const completedRuntime = new Set(payload.overlay.completedRuntimeSessionIds);
 
-  // A session gets its own card when:
-  //   • it is in_progress (always show, even if previously dismissed), OR
-  //   • it is non-archived and non-dismissed (matches CLAUDE.md policy:
-  //     "완료/유휴 상태는 기본적으로 카드 표시").
+  // Visibility policy:
+  //   • in_progress (running / waiting): always show
+  //   • runtime-completed (was in_progress true → false during this app
+  //     session) AND not dismissed: show with "완료" label
+  //   • everything else (idle past sessions, dismissed cards): hidden
   const candidates = payload.overlay.sessions.filter((session) => {
     if (session.isArchived) return false;
     if (session.inProgress) return true;
     if (dismissed.has(session.sessionId)) return false;
-    return true;
+    return completedRuntime.has(session.sessionId);
   });
 
-  // The candidate filter already excludes dismissed non-in_progress sessions,
-  // so this pass is a no-op but kept for safety/readability.
-  const filtered = candidates.filter(
-    (session) => session.inProgress || !dismissed.has(session.sessionId),
-  );
-
-  // Sort: in-progress first, then by recency.
-  const sorted = [...filtered].sort((a, b) => {
+  const sorted = [...candidates].sort((a, b) => {
     if (a.inProgress !== b.inProgress) return a.inProgress ? -1 : 1;
     return b.lastActivityAt - a.lastActivityAt;
   });
@@ -421,6 +416,11 @@ function sessionVisualState(
   if (session.inProgress) {
     const ageMs = Date.now() - session.lastActivityAt;
     return ageMs > 30_000 ? "waiting" : "running";
+  }
+  // Non-progress sessions that survived the visibility filter are
+  // runtime-completed; render them with the "완료됨" waving label.
+  if (payload.overlay.completedRuntimeSessionIds.includes(session.sessionId)) {
+    return "waving";
   }
   return "idle";
 }
@@ -502,20 +502,23 @@ function OverlayCardStack({
 }: {
   payload: AppPayload;
   strings: Messages;
-  onActivateSession: (sessionId: string) => void;
+  onActivateSession: (sessionId: string, appKind: SessionAppKind) => void;
 }) {
   const visible = pickVisibleSessions(payload);
   if (visible.length === 0) return null;
   const activeId = payload.overlay.activeSession?.sessionId ?? null;
+  const stackClass = payload.overlay.cardsBelow
+    ? "overlay-card-stack overlay-card-stack--below"
+    : "overlay-card-stack";
 
   return (
-    <div className="overlay-card-stack">
+    <div className={stackClass}>
       {visible.map((session) => (
         <OverlayCard
           key={session.sessionId}
           isActive={session.sessionId === activeId}
           language={payload.config.language}
-          onActivate={() => onActivateSession(session.sessionId)}
+          onActivate={() => onActivateSession(session.sessionId, session.appKind)}
           preview={sessionPreview(session, payload)}
           session={session}
           state={sessionVisualState(session, payload)}
@@ -666,10 +669,10 @@ function OverlayApp() {
     }
   }, [payload.overlay.pet.id]);
 
-  const handleActivateSession = async (sessionId?: string) => {
+  const handleActivateSession = async (sessionId?: string, appKind?: SessionAppKind) => {
     try {
-      if (sessionId) {
-        await call("cmd_focus_session_by_id", { sessionId });
+      if (sessionId && appKind) {
+        await call("cmd_focus_session_by_id", { sessionId, appKind });
       } else {
         await call("cmd_focus_active_session");
       }
@@ -731,7 +734,7 @@ function OverlayApp() {
   return (
     <div
       className="overlay-root"
-      style={{ "--pet-scale": payload.config.petScale } as React.CSSProperties}
+      style={{ "--pet-scale": String(payload.config.petScale) } as React.CSSProperties}
       onContextMenu={(event) => {
         event.preventDefault();
         setMenu(clampMenuPosition(event.clientX, event.clientY));

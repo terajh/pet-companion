@@ -146,6 +146,15 @@ pnpm tauri build --debug
   - **Capabilities 추가**: `core:window:allow-set-ignore-cursor-events` 권한을 `src-tauri/capabilities/default.json`에 추가. 이 권한 없이는 프론트에서 `setIgnoreCursorEvents()` 호출 시 "not allowed" 오류가 발생한다.
   - **미해결 위험 — 멀티 모니터 / 혼합 DPI**: 커서가 서로 다른 scale_factor를 가진 모니터 사이를 이동할 때, `outer_position()`과 `cursor_position()` 간의 좌표 계산에 단일 `scale_factor()`를 사용하면 좌표 오차가 발생할 수 있다. 현재 구현은 단일 scale_factor 가정이며, 멀티 모니터 혼합 DPI 환경에서는 hit-test가 약간 어긋날 수 있다. Tauri 2에서 모니터별 DPI를 가져오는 API(`MonitorHandle`)가 존재하나, 현재 단일 모니터 사용 환경에서는 충분하다.
 
+- **AppleScript `set frontmost to true` 버그 수정 (v0.1.2)**: macOS Sequoia에서 `tell process "X"` 블록 안의 `set frontmost to true`가 프로세스 객체가 아닌 LHS 타입 불일치로 `-10006` 에러를 발생시킨다. `try_raise_window_applescript`의 Step 1과 Step 2 스크립트 모두 `set frontmost of process "{proc}" to true`(블록 밖 명시적 형식)로 수정. 이 패턴은 `tell process` 블록 안에서 `frontmost`를 직접 할당하는 모든 AppleScript에 동일하게 적용됨.
+- **pet_scale 진단 로그 추가 (v0.1.2)**: `cmd_set_pet_scale` 진입 시 `eprintln!("[pet_scale] received scale=…")`로 IPC 수신 여부를 stderr에 출력. `persist_config`와 `refresh_and_emit` 실패 시도 각각 명시 로그 추가. 슬라이더 무반응 근본 원인 추가 분석: React CSS 커스텀 프로퍼티 inline style에서 숫자 값(`petScale: number`)이 아닌 문자열이어야 올바르게 적용되는 경우가 있어 `String(payload.config.petScale)` 형변환 추가. `PetScaleInput`에 `#[serde(rename_all = "camelCase")]`는 이미 적용되어 있어 IPC 직렬화 자체 문제는 없었음.
+- **Codex 프로세스명 후보군 확장 (기존 적용 확인)**: `query_supported_front_windows` JXA 스크립트에서 `codexRunning` 판별 시 `"Codex"` 및 `"Codex CLI"` 둘 다 확인하는 코드가 이미 존재함(`procNames.indexOf("Codex") !== -1 || procNames.indexOf("Codex CLI") !== -1`). `clear_stale_in_progress`가 `codex_running` 플래그를 통해 이 결과를 사용하므로 별도 수정 불필요.
+- **포커스 매칭 강화 (v0.1.3)**: `try_raise_window_applescript`에 세 가지 개선 추가.
+  1. **프로세스 존재 사전 체크**: Step 1/2 실행 전 `tell application "System Events" to exists process "X"` 를 먼저 실행한다. `false`이면 조용히 스킵(`eprintln!("[focus] process X not running, skipping")`만 남김). 덕분에 "Codex CLI"가 없는 환경에서 Step 1/2가 -10006을 뿌리는 시끄러운 로그가 사라지고, 진짜 권한 거부(-1743)와 창 매칭 실패(-1719)만 명확하게 보인다.
+  2. **Step 3 activate-only fallback 추가**: Step 1(cwd-basename), Step 2(title-prefix) 모두 실패해도 `set frontmost of process "X" to true`(창 매칭 없음)를 시도한다. Codex Desktop·Claude Desktop처럼 메인 창이 한 개인 앱에서는 이것만으로 포커스가 완성된다. -1719(invalid index) 같은 창 title 불일치 시 최후의 보루 역할. Step 3 성공 시 `[focus] Step 3 (activate process only) succeeded for X` 로그 출력.
+  3. **early return 보장**: 어느 단계에서든 성공하면(또는 -1743 권한 거부 시) 즉시 반환하여 후속 후보 프로세스 시도를 건너뜀. Codex의 `["Codex", "Codex CLI"]` 순차 시도에서도 첫 번째가 성공하면 두 번째를 시도하지 않음.
+  - **가정**: 이 패턴은 Claude Desktop / Codex Desktop처럼 메인 창이 1개인 앱에서 적합하다. 향후 Codex가 멀티 윈도우를 지원하면 Step 3가 잘못된 창을 frontmost로 만들 수 있음 — 미래 버전에서는 Step 1/2 매칭을 개선하거나 Step 3를 조건부로 비활성화할 것.
+
 ## 작업 규칙
 
 - 컴파운드 엔지니어링을 참고해서 문제 해결한 내역이 있으면, 같은 실수를 반복하지 않도록 이 파일 또는 관련 문서에 반드시 남긴다.

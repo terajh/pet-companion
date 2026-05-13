@@ -31,6 +31,16 @@ const ATTACHED_MARGIN_Y: i32 = 24;
 // macOS menu bar is roughly 24-28 pt; add a small top guard so the overlay
 // never creeps under the menu bar.
 const MACOS_MENU_BAR_HEIGHT: i32 = 28;
+// Pet sprite position within the overlay window (mirrors `.pet-shell` CSS at
+// scale=1: right:28px, bottom:16px, 112×124).  Used by `clamp_overlay_position`
+// to keep the *pet*, not the whole 520×760 window, inside the monitor frame so
+// the user can drag the pet up to the menu bar even though the upper portion of
+// the window is empty.
+const PET_BOX_RIGHT: i32 = 28;
+const PET_BOX_BOTTOM: i32 = 16;
+const PET_BOX_WIDTH: i32 = 112;
+const PET_BOX_HEIGHT: i32 = 124;
+const PET_VISIBLE_PADDING: i32 = 24;
 const RUNNING_THRESHOLD_MS: u64 = 3_000;
 const WAITING_THRESHOLD_MS: u64 = 30_000;
 const WAVING_DURATION_MS: u64 = 2_000;
@@ -106,6 +116,13 @@ struct OverlaySnapshot {
     show_card: bool,
     state_label: String,
     dismissed_session_ids: Vec<String>,
+    /// Session ids that transitioned from `in_progress=true` to `false`
+    /// during the current Pet Companion process lifetime.  Used by the
+    /// frontend to display a "완료" card that persists until clicked.
+    completed_runtime_session_ids: Vec<String>,
+    /// When true, the card stack should render *below* the pet because the
+    /// pet sits too close to the top of the monitor for cards to fit above.
+    cards_below: bool,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -197,6 +214,15 @@ struct RuntimeModel {
     // Completed/Idle card.  The card is hidden until the session re-enters
     // an in-progress state (Running / Waiting).
     dismissed_sessions: HashSet<String>,
+    /// session_ids that flipped from `in_progress=true` to `false` during
+    /// the current process lifetime.  Cleared per-id when the user clicks
+    /// the corresponding "완료" card, or when the session re-enters
+    /// `in_progress`.
+    completed_during_runtime: HashSet<String>,
+    /// Last observed `in_progress` value per session_id.  Used to detect
+    /// the true→false transition that promotes a session into
+    /// `completed_during_runtime`.
+    prev_in_progress: HashMap<String, bool>,
     last_base_state: Option<PetAnimationState>,
     last_completed_turns: HashMap<String, u64>,
     last_focused_app: Option<SessionApp>,
@@ -376,13 +402,22 @@ async fn cmd_set_pet_scale(
     state: State<'_, AppState>,
     input: PetScaleInput,
 ) -> Result<(), String> {
+    eprintln!("[pet_scale] received scale={}", input.scale);
     let clamped = input.scale.clamp(0.5, 2.0);
+    eprintln!("[pet_scale] clamped={}", clamped);
     {
         let mut model = state.model.lock().await;
         model.config.pet_scale = clamped;
-        persist_config(&state.config_path, &model.config)?;
+        persist_config(&state.config_path, &model.config).map_err(|e| {
+            eprintln!("[pet_scale] persist_config failed: {e}");
+            e
+        })?;
     }
-    refresh_and_emit(&app, &state).await?;
+    refresh_and_emit(&app, &state).await.map_err(|e| {
+        eprintln!("[pet_scale] refresh_and_emit failed: {e}");
+        e
+    })?;
+    eprintln!("[pet_scale] done, scale={}", clamped);
     Ok(())
 }
 
@@ -455,56 +490,45 @@ async fn cmd_begin_drag(app: AppHandle, state: State<'_, AppState>) -> Result<()
 #[tauri::command]
 async fn cmd_focus_session_by_id(
     session_id: String,
+    app_kind: SessionApp,
     app: AppHandle,
-    state: State<'_, AppState>,
+    _state: State<'_, AppState>,
 ) -> Result<(), String> {
-    // Find the session in the latest payload to determine its app + state.
-    let target = {
-        let mut model = state.model.lock().await;
-        let session = model
-            .current_payload
-            .as_ref()
-            .and_then(|payload| {
-                payload
-                    .overlay
-                    .sessions
-                    .iter()
-                    .find(|s| s.session_id == session_id)
-                    .cloned()
-            });
+    // Fire the activation IMMEDIATELY on a blocking thread — no mutex, no
+    // payload lookup.  The background 750ms refresh tick holds the model lock
+    // during its file-scan + JXA call, which used to add 200-500ms of latency
+    // here before we could spawn the activate.
+    //
+    // Codex exposes a `codex://threads/<conversationId>` URL handler that both
+    // activates the app and switches to the specific thread.  The session_id
+    // we emit for Codex is the conversation UUID from the rollout file's
+    // `session_meta.id`, so it can be plugged directly into the deep link.
+    // Claude has no per-conversation scheme — only the cowork artifact handler
+    // — so we fall back to a plain app activate.
+    let session_id_for_focus = session_id.clone();
+    tauri::async_runtime::spawn_blocking(move || match app_kind {
+        SessionApp::Codex => open_codex_thread(&session_id_for_focus),
+        SessionApp::Claude => bring_app_forward("Claude"),
+    });
 
-        // Dismiss the card if the session is currently in a completed/idle
-        // visual state.  We mirror the behaviour of cmd_focus_active_session:
-        // dismissed sessions remain hidden until they re-enter in_progress.
-        if let Some(ref s) = session {
-            if !s.in_progress {
-                model.dismissed_sessions.insert(s.session_id.clone());
-            }
-        }
-
-        session
-    };
-
-    // Spawn the AppleScript-driven window raise off the IPC critical path so
-    // the caller returns immediately (dismissed state is already committed above).
+    // Dismiss-and-refresh runs in the background; the user has already seen
+    // the target app come forward by the time the lock is granted.
     let app_clone = app.clone();
     tauri::async_runtime::spawn(async move {
         let state = app_clone.state::<AppState>();
-        match target {
-            Some(s) if s.app_kind == SessionApp::Codex => {
-                if let Err(e) = focus_codex_window_by_title(&s.cwd, &s.title) {
-                    eprintln!("[focus_session] codex window raise failed: {e}");
-                }
-            }
-            Some(s) if s.app_kind == SessionApp::Claude => {
-                if let Err(e) = focus_claude_window_by_title(&s.cwd, &s.title) {
-                    eprintln!("[focus_session] claude window raise failed: {e}");
-                }
-            }
-            _ => {
-                if let Err(e) = focus_claude_app() {
-                    eprintln!("[focus_session] focus_claude_app failed: {e}");
-                }
+        {
+            let mut model = state.model.lock().await;
+            let in_progress = model
+                .current_payload
+                .as_ref()
+                .and_then(|p| p.overlay.sessions.iter().find(|s| s.session_id == session_id))
+                .map(|s| s.in_progress)
+                .unwrap_or(false);
+            if !in_progress {
+                model.dismissed_sessions.insert(session_id.clone());
+                // A click on a "완료" card both opens the target and clears
+                // the runtime-completion marker so it stops showing.
+                model.completed_during_runtime.remove(&session_id);
             }
         }
         let _ = refresh_and_emit(&app_clone, &state).await;
@@ -835,11 +859,12 @@ fn build_tray(app: &mut tauri::App) -> tauri::Result<()> {
 async fn refresh_and_emit(app: &AppHandle, state: &AppState) -> Result<(), String> {
     let payload = {
         let mut model = state.model.lock().await;
-        let payload = rebuild_payload(&mut model, &state.config_path)?;
+        let mut payload = rebuild_payload(&mut model, &state.config_path)?;
         let new_expected_pos = sync_overlay_window(app, &mut model.config, &state.config_path, &payload.overlay);
         if new_expected_pos.is_some() {
             model.expected_attached_position = new_expected_pos;
         }
+        payload.overlay.cards_below = compute_cards_below(app);
         if !payload.overlay.permission_granted && !model.onboarding_shown {
             if let Some(window) = app.get_webview_window(SETTINGS_WINDOW_LABEL) {
                 let _ = window.show();
@@ -851,6 +876,47 @@ async fn refresh_and_emit(app: &AppHandle, state: &AppState) -> Result<(), Strin
         payload
     };
     app.emit(APP_EVENT, payload).map_err(|e| e.to_string())
+}
+
+/// Returns true when the pet sits close enough to the top of its monitor that
+/// the card stack would clip off-screen if rendered above the pet; in that
+/// case the frontend flips the stack to render below.
+fn compute_cards_below(app: &AppHandle) -> bool {
+    let Some(window) = app.get_webview_window(OVERLAY_WINDOW_LABEL) else {
+        return false;
+    };
+    let scale = window.scale_factor().unwrap_or(1.0).max(1.0);
+    let Ok(physical) = window.outer_position() else {
+        return false;
+    };
+    let window_y = (physical.y as f64 / scale).round() as i32;
+    let pet_local_y = OVERLAY_HEIGHT - PET_BOX_BOTTOM - PET_BOX_HEIGHT;
+    let pet_top_screen = window_y + pet_local_y;
+
+    // Find the monitor the pet sits on (or nearest).
+    let Ok(monitors) = window.available_monitors() else {
+        return false;
+    };
+    let Ok(physical_x) = window.outer_position().map(|p| (p.x as f64 / scale).round() as i32) else {
+        return false;
+    };
+    let pet_local_x = OVERLAY_WIDTH - PET_BOX_RIGHT - PET_BOX_WIDTH;
+    let pet_cx = physical_x + pet_local_x + PET_BOX_WIDTH / 2;
+    let pet_cy = pet_top_screen + PET_BOX_HEIGHT / 2;
+    let monitor_top = monitors
+        .iter()
+        .find(|m| {
+            let (mx, my, mw, mh) = logical_monitor_frame(m);
+            pet_cx >= mx && pet_cx <= mx + mw && pet_cy >= my && pet_cy <= my + mh
+        })
+        .map(|m| logical_monitor_frame(m).1);
+    let Some(top) = monitor_top else {
+        return false;
+    };
+
+    // Card stack max height heuristic — 6 cards × ~80px + gaps + padding.
+    const CARD_STACK_RESERVE: i32 = 520;
+    pet_top_screen - top < CARD_STACK_RESERVE
 }
 
 fn rebuild_payload(model: &mut RuntimeModel, config_path: &Path) -> Result<AppPayload, String> {
@@ -888,6 +954,27 @@ fn rebuild_payload(model: &mut RuntimeModel, config_path: &Path) -> Result<AppPa
     // Prune dismissed_sessions for session ids that no longer exist.
     let live_ids: HashSet<String> = sessions.iter().map(|s| s.session_id.clone()).collect();
     model.dismissed_sessions.retain(|id| live_ids.contains(id));
+    model.completed_during_runtime.retain(|id| live_ids.contains(id));
+    model.prev_in_progress.retain(|id, _| live_ids.contains(id));
+
+    // Detect in_progress true→false transitions during this runtime so that
+    // such sessions are surfaced as "완료" cards until dismissed.  Sessions
+    // that were already completed at app start (no prior `true` observation)
+    // are intentionally excluded.
+    for session in &sessions {
+        let prev = model.prev_in_progress.get(&session.session_id).copied();
+        if prev == Some(true) && !session.in_progress {
+            model.completed_during_runtime.insert(session.session_id.clone());
+        }
+        if session.in_progress {
+            // A re-entry into in_progress also resets the runtime completion flag —
+            // the card will reappear after the next true→false transition.
+            model.completed_during_runtime.remove(&session.session_id);
+        }
+        model
+            .prev_in_progress
+            .insert(session.session_id.clone(), session.in_progress);
+    }
 
     let current_turn_completed = detect_turn_completion(model, active_session.as_ref());
     let pet_resolution = resolve_pet_selection(&mut model.config, &codex_state)?;
@@ -983,6 +1070,14 @@ fn rebuild_payload(model: &mut RuntimeModel, config_path: &Path) -> Result<AppPa
             show_card,
             state_label: state_label(base_state).to_string(),
             dismissed_session_ids: model.dismissed_sessions.iter().cloned().collect(),
+            completed_runtime_session_ids: model
+                .completed_during_runtime
+                .iter()
+                .cloned()
+                .collect(),
+            // Computed by `refresh_and_emit` based on the live overlay window
+            // position; defaulted here.
+            cards_below: false,
         },
         pets: list_custom_pets()?,
     })
@@ -2156,138 +2251,64 @@ fn sync_overlay_window(
 }
 
 fn focus_claude_app() -> Result<(), String> {
-    Command::new("open")
-        .arg("-a")
-        .arg("Claude")
-        .status()
-        .map_err(|e| e.to_string())?;
+    bring_app_forward("Claude");
     Ok(())
 }
 
-fn focus_claude_window_by_title(cwd: &str, title: &str) -> Result<(), String> {
-    // K1 matching chain:
-    // Step 1: Try cwd basename match via System Events AXRaise.
-    // Step 2: Try title prefix match (first 20 chars).
-    // Step 3: Fall back to open -a (LaunchServices, no Automation permission needed).
-    //
-    // NOTE: AppleScript requires Automation permission keyed by code signature.
-    // `pnpm tauri dev` re-signs on every rebuild, invalidating TCC.  The debug
-    // bundle (src-tauri/target/debug/bundle/macos/Claude Pet Companion.app) has
-    // a stable signature, so AppleScript works there.
-    let process_name = "Claude";
-    if try_raise_window_applescript(process_name, cwd, title) {
-        return Ok(());
+/// Fast app activation: single `osascript` invocation that combines activate
+/// + unhide.  `tell application X to activate` will launch the app if it's not
+/// running, bring it foreground, and unhide hidden windows in one Apple Event.
+/// The `if running` guard on `System Events` ensures we don't trigger a launch
+/// via System Events if the app is unknown.
+fn bring_app_forward(app_name: &str) {
+    let esc = escape_applescript(app_name);
+    let script = format!(
+        r#"tell application "{esc}" to activate
+tell application "System Events"
+  if exists process "{esc}" then set visible of process "{esc}" to true
+end tell"#
+    );
+    let out = Command::new("osascript").arg("-e").arg(&script).output();
+    if let Ok(o) = &out {
+        if !o.status.success() {
+            let err = String::from_utf8_lossy(&o.stderr);
+            eprintln!("[focus] activate '{app_name}' failed: {}", err.trim());
+        }
     }
-    eprintln!("[focus] AppleScript failed for Claude — falling back to open -a");
-    focus_claude_app()
+}
+
+fn focus_claude_window_by_title(_cwd: &str, _title: &str) -> Result<(), String> {
+    bring_app_forward("Claude");
+    Ok(())
 }
 
 fn focus_codex_app() -> Result<(), String> {
-    // Try known Codex app bundle names in order.
-    for app_name in &["Codex", "Codex CLI"] {
-        let status = Command::new("open")
-            .arg("-a")
-            .arg(app_name)
-            .status()
-            .map_err(|e| e.to_string())?;
-        if status.success() {
-            return Ok(());
-        }
-    }
+    bring_app_forward("Codex");
     Ok(())
 }
 
-fn focus_codex_window_by_title(cwd: &str, title: &str) -> Result<(), String> {
-    // Try Codex process name candidates in order (K1 matching chain).
-    for process_name in &["Codex", "Codex CLI"] {
-        if try_raise_window_applescript(process_name, cwd, title) {
-            return Ok(());
+/// Deep-link to a specific Codex conversation.  Codex registers
+/// `codex://threads/<id>` which both raises the app and switches to that thread
+/// in one call — no AppleScript, no mutex, no extra unhide step.
+fn open_codex_thread(session_id: &str) {
+    let url = format!("codex://threads/{session_id}");
+    let out = Command::new("open").arg(&url).status();
+    if let Ok(s) = out {
+        if !s.success() {
+            eprintln!("[focus] open '{url}' exited with {s}");
         }
+    } else if let Err(e) = out {
+        eprintln!("[focus] open '{url}' failed: {e}");
     }
-    eprintln!("[focus] AppleScript failed for all Codex process names — falling back to open -a");
-    focus_codex_app()
+    // `open codex://…` triggers the URL handler but does not always raise the
+    // window to the front when Codex is hidden or backgrounded.  Follow up
+    // with an explicit activate so the thread becomes visible immediately.
+    bring_app_forward("Codex");
 }
 
-/// Attempt to raise a specific window in `process_name` using AppleScript via
-/// System Events.  Tries cwd-basename first, then a title prefix.
-/// Returns true if a window was successfully raised.
-fn try_raise_window_applescript(process_name: &str, cwd: &str, title: &str) -> bool {
-    // Step 1: cwd basename.
-    let basename = std::path::Path::new(cwd)
-        .file_name()
-        .and_then(|n| n.to_str())
-        .unwrap_or("")
-        .to_string();
-
-    if !basename.is_empty() {
-        let search = escape_applescript(&basename);
-        let script = format!(
-            r#"tell application "System Events"
-  tell process "{proc}"
-    set frontmost to true
-    perform action "AXRaise" of (first window whose title contains "{search}")
-  end tell
-end tell"#,
-            proc = escape_applescript(process_name),
-            search = search
-        );
-        let out = Command::new("osascript").arg("-e").arg(&script).output();
-        match &out {
-            Ok(o) => {
-                let stderr = String::from_utf8_lossy(&o.stderr);
-                let trimmed = stderr.trim();
-                if o.status.success() {
-                    eprintln!("[focus] Step 1 (cwd-basename={search}) raised window in {process_name}");
-                    return true;
-                }
-                if trimmed.contains("-1743") {
-                    eprintln!("[focus] Automation permission denied (-1743) — user must grant in System Settings > Privacy & Security > Automation");
-                    return false;
-                }
-                eprintln!("[focus] Step 1 (cwd-basename={search}) failed for {process_name}: exit={}, stderr={trimmed}", o.status);
-            }
-            Err(e) => {
-                eprintln!("[focus] Step 1 osascript exec error for {process_name}: {e}");
-            }
-        }
-    }
-
-    // Step 2: title prefix (first 20 chars).
-    let title_prefix: String = title.chars().take(20).collect();
-    if !title_prefix.is_empty() {
-        let search = escape_applescript(&title_prefix);
-        let script = format!(
-            r#"tell application "System Events"
-  tell process "{proc}"
-    set frontmost to true
-    perform action "AXRaise" of (first window whose title contains "{search}")
-  end tell
-end tell"#,
-            proc = escape_applescript(process_name),
-            search = search
-        );
-        let out = Command::new("osascript").arg("-e").arg(&script).output();
-        match &out {
-            Ok(o) => {
-                let stderr = String::from_utf8_lossy(&o.stderr);
-                let trimmed = stderr.trim();
-                if o.status.success() {
-                    eprintln!("[focus] Step 2 (title-prefix={search}) raised window in {process_name}");
-                    return true;
-                }
-                if trimmed.contains("-1743") {
-                    eprintln!("[focus] Automation permission denied (-1743) — user must grant in System Settings > Privacy & Security > Automation");
-                    return false;
-                }
-                eprintln!("[focus] Step 2 (title-prefix={search}) failed for {process_name}: exit={}, stderr={trimmed}", o.status);
-            }
-            Err(e) => {
-                eprintln!("[focus] Step 2 osascript exec error for {process_name}: {e}");
-            }
-        }
-    }
-
-    false
+fn focus_codex_window_by_title(_cwd: &str, _title: &str) -> Result<(), String> {
+    bring_app_forward("Codex");
+    Ok(())
 }
 
 #[allow(dead_code)]
@@ -2391,8 +2412,14 @@ fn overlay_rect_visible_on_monitor(
     let (ox, oy) = overlay_xy;
     let (mx, my, mw, mh) = logical_monitor_frame(monitor);
 
-    let overlap_x = (ox + OVERLAY_WIDTH).min(mx + mw) - ox.max(mx);
-    let overlap_y = (oy + OVERLAY_HEIGHT).min(my + mh) - oy.max(my);
+    // Check the pet rectangle (not the whole transparent window) since the
+    // upper portion is intentionally empty and may extend off-screen.
+    let pet_local_x = OVERLAY_WIDTH - PET_BOX_RIGHT - PET_BOX_WIDTH;
+    let pet_local_y = OVERLAY_HEIGHT - PET_BOX_BOTTOM - PET_BOX_HEIGHT;
+    let px = ox + pet_local_x;
+    let py = oy + pet_local_y;
+    let overlap_x = (px + PET_BOX_WIDTH).min(mx + mw) - px.max(mx);
+    let overlap_y = (py + PET_BOX_HEIGHT).min(my + mh) - py.max(my);
     overlap_x >= min_overlap_px && overlap_y >= min_overlap_px
 }
 
@@ -2494,8 +2521,13 @@ fn clamp_overlay_position(window: &tauri::WebviewWindow, x: i32, y: i32) -> (i32
         return (x, y);
     }
 
-    let center_x = x + OVERLAY_WIDTH / 2;
-    let center_y = y + OVERLAY_HEIGHT / 2;
+    // Clamp by the pet rectangle (window-local), not the whole window, so the
+    // user can drag the pet to the menu bar even though the upper part of the
+    // 520×760 window is empty and would otherwise clip against the screen top.
+    let pet_local_x = OVERLAY_WIDTH - PET_BOX_RIGHT - PET_BOX_WIDTH;
+    let pet_local_y = OVERLAY_HEIGHT - PET_BOX_BOTTOM - PET_BOX_HEIGHT;
+    let pet_center_x = x + pet_local_x + PET_BOX_WIDTH / 2;
+    let pet_center_y = y + pet_local_y + PET_BOX_HEIGHT / 2;
 
     let mut chosen = &monitors[0];
     let mut best_distance = i64::MAX;
@@ -2504,22 +2536,26 @@ fn clamp_overlay_position(window: &tauri::WebviewWindow, x: i32, y: i32) -> (i32
         let max_x = min_x + width;
         let max_y = min_y + height;
 
-        if center_x >= min_x && center_x <= max_x && center_y >= min_y && center_y <= max_y {
+        if pet_center_x >= min_x
+            && pet_center_x <= max_x
+            && pet_center_y >= min_y
+            && pet_center_y <= max_y
+        {
             chosen = monitor;
             break;
         }
 
-        let dx = if center_x < min_x {
-            (min_x - center_x) as i64
-        } else if center_x > max_x {
-            (center_x - max_x) as i64
+        let dx = if pet_center_x < min_x {
+            (min_x - pet_center_x) as i64
+        } else if pet_center_x > max_x {
+            (pet_center_x - max_x) as i64
         } else {
             0
         };
-        let dy = if center_y < min_y {
-            (min_y - center_y) as i64
-        } else if center_y > max_y {
-            (center_y - max_y) as i64
+        let dy = if pet_center_y < min_y {
+            (min_y - pet_center_y) as i64
+        } else if pet_center_y > max_y {
+            (pet_center_y - max_y) as i64
         } else {
             0
         };
@@ -2530,9 +2566,15 @@ fn clamp_overlay_position(window: &tauri::WebviewWindow, x: i32, y: i32) -> (i32
         }
     }
 
-    let (min_x, min_y, width, height) = logical_monitor_frame(chosen);
-    let max_x = min_x + width - OVERLAY_WIDTH;
-    let max_y = min_y + height - OVERLAY_HEIGHT;
+    let (mon_x, mon_y, width, height) = logical_monitor_frame(chosen);
+
+    // The pet's top-left in screen coords is (x + pet_local_x, y + pet_local_y).
+    // Require pet rect to stay inside [monitor + padding, monitor + size - padding],
+    // with menu-bar guard on top. Solve for window x/y.
+    let min_x = mon_x + PET_VISIBLE_PADDING - pet_local_x;
+    let max_x = mon_x + width - PET_BOX_WIDTH - PET_VISIBLE_PADDING - pet_local_x;
+    let min_y = mon_y + MACOS_MENU_BAR_HEIGHT + PET_VISIBLE_PADDING - pet_local_y;
+    let max_y = mon_y + height - PET_BOX_HEIGHT - PET_VISIBLE_PADDING - pet_local_y;
 
     let clamped_x = x.clamp(min_x, max_x.max(min_x));
     let clamped_y = y.clamp(min_y, max_y.max(min_y));
