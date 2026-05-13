@@ -38,6 +38,7 @@ export interface CompanionConfig {
   manualSessionApp: SessionAppKind | null;
   manualSessionId: string | null;
   petOverrideId: string | null;
+  petScale: number;
 }
 
 export interface OverlaySnapshot {

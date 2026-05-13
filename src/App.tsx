@@ -22,6 +22,7 @@ const INITIAL_PAYLOAD: AppPayload = {
     manualSessionApp: null,
     manualSessionId: null,
     petOverrideId: null,
+    petScale: 1.0,
   },
   codexSelectedPetId: null,
   overlay: {
@@ -64,8 +65,8 @@ const STATE_ROWS: Record<
 
 const SPRITE_WIDTH = 96;
 const SPRITE_HEIGHT = 104;
-const MENU_WIDTH = 248;
-const MENU_MAX_HEIGHT = 280;
+const MENU_WIDTH = 140;
+const MENU_MAX_HEIGHT = 60;
 const MENU_MARGIN = 12;
 
 type ContextMenuState = {
@@ -102,6 +103,7 @@ const MESSAGES = {
     noCustomPet: "No custom pet",
     openPetsFolder: "Open ~/.codex/pets",
     openSettings: "Open Settings",
+    petScale: "Pet size",
     permissionBody:
       "Without Accessibility access, the pet stays detached and cannot anchor to the active Claude or Codex window.",
     permissionCta: "Open System Settings",
@@ -144,6 +146,7 @@ const MESSAGES = {
     noCustomPet: "선택된 커스텀 펫 없음",
     openPetsFolder: "~/.codex/pets 열기",
     openSettings: "설정 열기",
+    petScale: "캐릭터 크기",
     permissionBody:
       "손쉬운 사용 권한이 없으면 펫은 분리 상태로만 동작하고 Claude 또는 Codex 창에 붙어다니지 못합니다.",
     permissionCta: "시스템 설정 열기",
@@ -358,6 +361,8 @@ function PetSprite({
         backgroundPosition: `-${frame * SPRITE_WIDTH}px -${spec.row * SPRITE_HEIGHT}px`,
         width: `${SPRITE_WIDTH}px`,
         height: `${SPRITE_HEIGHT}px`,
+        transform: "scale(var(--pet-scale, 1))",
+        transformOrigin: "bottom right",
       }}
       aria-label={`${pet.displayName} ${state}`}
       role="img"
@@ -524,131 +529,118 @@ function OverlayCardStack({
 function ContextMenu({
   menu,
   onClose,
-  onFocusSession,
   onOpenSettings,
-  onReattach,
-  onSelectTrackedApp,
-  onSelectSession,
-  payload,
-  strings,
 }: {
   menu: ContextMenuState;
   onClose: () => void;
-  onFocusSession: () => void;
   onOpenSettings: () => void;
-  onReattach: () => void;
-  onSelectTrackedApp: (app: "auto" | SessionAppKind) => void;
-  onSelectSession: (app: SessionAppKind | null, sessionId: string | null) => void;
-  payload: AppPayload;
   strings: Messages;
 }) {
   if (!menu) {
     return null;
   }
 
-  const pinnedSessionId = payload.config.manualSessionId;
-  const pinnedSessionApp = payload.config.manualSessionApp;
-  const claudeSessions = payload.overlay.sessions.filter((session) => session.appKind === "claude");
-  const codexSessions = payload.overlay.sessions.filter((session) => session.appKind === "codex");
-
   return (
     <>
       <div className="menu-backdrop" onClick={onClose} />
       <div className="context-menu" style={{ left: menu.x, top: menu.y }}>
-        <button className="context-menu__item" onClick={onFocusSession} type="button">
-          {payload.overlay.activeSession
-            ? `${appBadge(payload.overlay.activeSession.appKind, strings)} ${strings.focusApp}`
-            : strings.focusApp}
-        </button>
-        <button className="context-menu__item" onClick={onReattach} type="button">
-          {strings.attachToClaude}
-        </button>
         <button className="context-menu__item" onClick={onOpenSettings} type="button">
-          {strings.openSettings}
+          설정 열기
         </button>
-        <div className="context-menu__separator" />
-        <div className="context-menu__section-label">{strings.pinSection}</div>
-        <button
-          className={`context-menu__item ${
-            pinnedSessionId === null && payload.config.trackedApp === "auto" ? "is-selected" : ""
-          }`}
-          onClick={() => {
-            onSelectSession(null, null);
-            onSelectTrackedApp("auto");
-          }}
-          type="button"
-        >
-          {strings.autoTrackApp}
-        </button>
-        <button
-          className={`context-menu__item ${
-            pinnedSessionId === null && payload.config.trackedApp === "claude" ? "is-selected" : ""
-          }`}
-          onClick={() => {
-            onSelectSession(null, null);
-            onSelectTrackedApp("claude");
-          }}
-          type="button"
-        >
-          {strings.trackClaudeOnly}
-        </button>
-        <button
-          className={`context-menu__item ${
-            pinnedSessionId === null && payload.config.trackedApp === "codex" ? "is-selected" : ""
-          }`}
-          onClick={() => {
-            onSelectSession(null, null);
-            onSelectTrackedApp("codex");
-          }}
-          type="button"
-        >
-          {strings.trackCodexOnly}
-        </button>
-        {claudeSessions.length > 0 ? (
-          <>
-            <div className="context-menu__separator" />
-            <div className="context-menu__section-label">{strings.badgeClaude}</div>
-          </>
-        ) : null}
-        {claudeSessions.slice(0, 6).map((session) => (
-          <button
-            className={`context-menu__item ${
-              pinnedSessionId === session.sessionId && pinnedSessionApp === "claude"
-                ? "is-selected"
-                : ""
-            }`}
-            key={`claude-${session.sessionId}`}
-            onClick={() => onSelectSession("claude", session.sessionId)}
-            type="button"
-            title={session.title}
-          >
-            {session.title}
-          </button>
-        ))}
-        {codexSessions.length > 0 ? (
-          <>
-            <div className="context-menu__separator" />
-            <div className="context-menu__section-label">{strings.badgeCodex}</div>
-          </>
-        ) : null}
-        {codexSessions.slice(0, 6).map((session) => (
-          <button
-            className={`context-menu__item ${
-              pinnedSessionId === session.sessionId && pinnedSessionApp === "codex"
-                ? "is-selected"
-                : ""
-            }`}
-            key={`codex-${session.sessionId}`}
-            onClick={() => onSelectSession("codex", session.sessionId)}
-            type="button"
-            title={session.title}
-          >
-            {session.title}
-          </button>
-        ))}
       </div>
     </>
   );
+}
+
+/**
+ * Returns true when the element at (x, y) belongs to an interactive region.
+ * We use closest() so any child of the hit containers also matches correctly.
+ */
+function isInteractivePoint(x: number, y: number): boolean {
+  const el = document.elementFromPoint(x, y);
+  if (!el) return false;
+  return Boolean(
+    el.closest(".pet-shell, .overlay-card-stack, .context-menu, .menu-backdrop"),
+  );
+}
+
+/**
+ * Dynamic hit-test hook for the overlay window.
+ *
+ * Strategy (option C from spec):
+ *   • When ignore=false (normal): native mousemove fires → we check hit and
+ *     call setIgnoreCursorEvents(true) when cursor is over a transparent gap.
+ *   • When ignore=true (pass-through): OS swallows mousemove, so we poll
+ *     Rust cmd_cursor_position_in_overlay every 50 ms and re-enable hit-test
+ *     when cursor re-enters an interactive element.
+ *   • While context menu is open we force ignore=false unconditionally so
+ *     backdrop and menu items always receive clicks.
+ *
+ * Coordinate guarantee:
+ *   cmd_cursor_position_in_overlay converts:
+ *     physical_cursor − physical_window_origin) / scale_factor  →  logical px
+ *   This matches clientX/clientY used by elementFromPoint().
+ */
+function useOverlayHitTest(menuOpen: boolean): void {
+  useEffect(() => {
+    if (windowLabel !== "overlay") return;
+
+    const win = getCurrentWebviewWindow();
+    let ignoring = false;
+
+    const applyIgnore = (next: boolean): void => {
+      if (next === ignoring) return;
+      ignoring = next;
+      win.setIgnoreCursorEvents(next).catch(() => {});
+    };
+
+    // Start fully transparent so the overlay never blocks anything at init.
+    applyIgnore(true);
+
+    // --- native mousemove path (ignore=false) ---
+    const onMove = (e: MouseEvent): void => {
+      if (menuOpen) {
+        applyIgnore(false);
+        return;
+      }
+      applyIgnore(!isInteractivePoint(e.clientX, e.clientY));
+    };
+
+    window.addEventListener("mousemove", onMove, { passive: true });
+
+    // --- polling path (ignore=true) ---
+    // When pass-through is active the OS never delivers mousemove, so we
+    // periodically ask Rust for the current cursor position in window-local
+    // logical coordinates and re-enable hit-test if the cursor is back over
+    // an interactive element.
+    const pollId = window.setInterval(async () => {
+      if (!ignoring) return; // native mousemove path handles it
+      if (menuOpen) {
+        applyIgnore(false);
+        return;
+      }
+      try {
+        const pos = await call<[number, number] | null>(
+          "cmd_cursor_position_in_overlay",
+        );
+        if (pos) {
+          const [x, y] = pos;
+          if (isInteractivePoint(x, y)) {
+            applyIgnore(false);
+            // Native mousemove takes over from here once ignore=false.
+          }
+        }
+      } catch {
+        // Non-fatal: next tick will retry.
+      }
+    }, 50);
+
+    return () => {
+      window.removeEventListener("mousemove", onMove);
+      window.clearInterval(pollId);
+      applyIgnore(false);
+    };
+  }, [menuOpen]);
 }
 
 function OverlayApp() {
@@ -659,6 +651,11 @@ function OverlayApp() {
   const pointerStartRef = useRef<{ x: number; y: number } | null>(null);
   const dragStartedRef = useRef(false);
   const strings = MESSAGES[payload.config.language];
+
+  // Dynamic hit-test: transparent areas pass clicks through; interactive
+  // elements (.pet-shell, cards, context menu) receive events normally.
+  // When the context menu is open we force ignore=false so backdrop/items work.
+  useOverlayHitTest(menu !== null);
 
   // Reset loaded state when the pet changes so the placeholder shows briefly.
   const prevPetIdRef = useRef(payload.overlay.pet.id);
@@ -734,6 +731,7 @@ function OverlayApp() {
   return (
     <div
       className="overlay-root"
+      style={{ "--pet-scale": payload.config.petScale } as React.CSSProperties}
       onContextMenu={(event) => {
         event.preventDefault();
         setMenu(clampMenuPosition(event.clientX, event.clientY));
@@ -779,27 +777,10 @@ function OverlayApp() {
       <ContextMenu
         menu={menu}
         onClose={() => setMenu(null)}
-        onFocusSession={() => {
-          setMenu(null);
-          handleActivateSession().catch(console.error);
-        }}
         onOpenSettings={() => {
           setMenu(null);
           call("cmd_show_settings").catch(console.error);
         }}
-        onReattach={() => {
-          setMenu(null);
-          call("cmd_reattach_overlay").catch(console.error);
-        }}
-        onSelectTrackedApp={(app) => {
-          setMenu(null);
-          call("cmd_set_tracked_app", { app }).catch(console.error);
-        }}
-        onSelectSession={(app, sessionId) => {
-          setMenu(null);
-          call("cmd_set_manual_session", { appKind: app, sessionId }).catch(console.error);
-        }}
-        payload={payload}
         strings={strings}
       />
     </div>
@@ -846,7 +827,7 @@ function SettingsApp() {
   };
 
   return (
-    <div className="settings-root">
+    <div className="settings-root" style={{ pointerEvents: "auto", userSelect: "text" }}>
       <header className="settings-header">
         <div>
           <h1>{strings.title}</h1>
@@ -957,6 +938,19 @@ function SettingsApp() {
               </option>
             ))}
           </select>
+        </label>
+        <label className="stacked-field">
+          <span>{strings.petScale} ({Math.round(payload.config.petScale * 100)}%)</span>
+          <input
+            type="range"
+            min="0.5"
+            max="2.0"
+            step="0.1"
+            value={payload.config.petScale}
+            onChange={(e) =>
+              call("cmd_set_pet_scale", { input: { scale: Number(e.target.value) } }).catch(console.error)
+            }
+          />
         </label>
         <button
           className="secondary-button"

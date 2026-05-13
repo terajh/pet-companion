@@ -25,7 +25,7 @@ const SETTINGS_WINDOW_LABEL: &str = "settings";
 const TRAY_ID: &str = "companion-tray";
 const FALLBACK_PET_ID: &str = "bori";
 const OVERLAY_WIDTH: i32 = 520;
-const OVERLAY_HEIGHT: i32 = 420;
+const OVERLAY_HEIGHT: i32 = 760;
 const ATTACHED_MARGIN_X: i32 = 24;
 const ATTACHED_MARGIN_Y: i32 = 24;
 // macOS menu bar is roughly 24-28 pt; add a small top guard so the overlay
@@ -116,6 +116,7 @@ struct FrontendConfig {
     manual_session_app: Option<SessionApp>,
     manual_session_id: Option<String>,
     pet_override_id: Option<String>,
+    pet_scale: f32,
     tracked_app: String,
 }
 
@@ -141,6 +142,8 @@ struct PersistedConfig {
     pet_override_id: Option<String>,
     #[serde(default = "default_tracked_app")]
     tracked_app: String,
+    #[serde(default = "default_pet_scale")]
+    pet_scale: f32,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
@@ -236,6 +239,12 @@ struct TrackedAppInput {
     app: String,
 }
 
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct PetScaleInput {
+    scale: f32,
+}
+
 
 #[derive(Debug, Clone)]
 struct PetResolution {
@@ -267,6 +276,7 @@ impl Default for PersistedConfig {
             manual_session_app: None,
             manual_session_id: None,
             pet_override_id: None,
+            pet_scale: default_pet_scale(),
             tracked_app: default_tracked_app(),
         }
     }
@@ -354,6 +364,22 @@ async fn cmd_set_language(
     {
         let mut model = state.model.lock().await;
         model.config.language = language.to_string();
+        persist_config(&state.config_path, &model.config)?;
+    }
+    refresh_and_emit(&app, &state).await?;
+    Ok(())
+}
+
+#[tauri::command]
+async fn cmd_set_pet_scale(
+    app: AppHandle,
+    state: State<'_, AppState>,
+    input: PetScaleInput,
+) -> Result<(), String> {
+    let clamped = input.scale.clamp(0.5, 2.0);
+    {
+        let mut model = state.model.lock().await;
+        model.config.pet_scale = clamped;
         persist_config(&state.config_path, &model.config)?;
     }
     refresh_and_emit(&app, &state).await?;
@@ -575,6 +601,31 @@ async fn cmd_open_pets_folder() -> Result<(), String> {
     open_path(&pet_dir)
 }
 
+/// Returns the cursor position in overlay-window logical coordinates (origin = top-left of window).
+///
+/// Coordinate mapping:
+///   cursor_position() → PhysicalPosition<f64>  — global screen physical pixels
+///   outer_position()  → PhysicalPosition<i32>  — window top-left in physical pixels
+///   scale_factor()    → f64                    — device pixel ratio (2.0 on Retina)
+///
+/// Formula:
+///   logical_x = (cursor_physical_x - window_origin_x) / scale
+///   logical_y = (cursor_physical_y - window_origin_y) / scale
+///
+/// Returns None when the overlay window is not found or any position query fails.
+#[tauri::command]
+fn cmd_cursor_position_in_overlay(app: tauri::AppHandle) -> Option<(f64, f64)> {
+    let win = app.get_webview_window(OVERLAY_WINDOW_LABEL)?;
+    // cursor_position() → PhysicalPosition<f64>, global screen coordinates
+    let cursor = win.cursor_position().ok()?;
+    // outer_position() → PhysicalPosition<i32>, window origin in physical pixels
+    let origin = win.outer_position().ok()?;
+    let scale = win.scale_factor().ok()?;
+    let logical_x = (cursor.x - origin.x as f64) / scale;
+    let logical_y = (cursor.y - origin.y as f64) / scale;
+    Some((logical_x, logical_y))
+}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     let config_path = app_support_dir()
@@ -691,8 +742,10 @@ pub fn run() {
             cmd_set_language,
             cmd_set_manual_session,
             cmd_set_pet_override,
+            cmd_set_pet_scale,
             cmd_set_tracked_app,
             cmd_show_settings,
+            cmd_cursor_position_in_overlay,
         ])
         .run(tauri::generate_context!())
         .expect("error while running Tauri application");
@@ -912,6 +965,7 @@ fn rebuild_payload(model: &mut RuntimeModel, config_path: &Path) -> Result<AppPa
             manual_session_app: model.config.manual_session_app,
             manual_session_id: model.config.manual_session_id.clone(),
             pet_override_id: model.config.pet_override_id.clone(),
+            pet_scale: model.config.pet_scale,
             tracked_app: normalize_tracked_app(&model.config.tracked_app).to_string(),
         },
         overlay: OverlaySnapshot {
@@ -1365,6 +1419,10 @@ fn default_language() -> String {
 
 fn default_tracked_app() -> String {
     "auto".to_string()
+}
+
+fn default_pet_scale() -> f32 {
+    1.0
 }
 
 fn normalize_language(language: &str) -> &'static str {

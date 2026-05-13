@@ -26,14 +26,29 @@ select {
   width: 100vw;
   height: 100vh;
   user-select: none;
+  /* Transparent areas must not capture mouse events — setIgnoreCursorEvents
+     handles the window-level toggle, but this ensures child elements that are
+     not explicitly marked pointer-events:auto also pass clicks through. */
+  pointer-events: none;
+}
+
+/* Settings window: ensure all interactions are enabled regardless of overlay CSS */
+.settings-root {
+  pointer-events: auto !important;
+  user-select: text;
+}
+
+.settings-root * {
+  pointer-events: auto;
+  user-select: auto;
 }
 
 .pet-shell {
   position: absolute;
   right: 28px;
   bottom: 16px;
-  width: 112px;
-  height: 124px;
+  width: calc(112px * var(--pet-scale, 1));
+  height: calc(124px * var(--pet-scale, 1));
   display: grid;
   place-items: center;
   border-radius: 24px;
@@ -45,6 +60,8 @@ select {
      so the grab cursor would never be seen without this. */
   background: rgba(255, 255, 255, 0.06);
   outline: 1px dashed rgba(255, 255, 255, 0.15);
+  /* .overlay-root sets pointer-events:none; re-enable for interactive elements */
+  pointer-events: auto;
 }
 
 .pet-shell.is-loaded {
@@ -113,15 +130,13 @@ select {
 
 .overlay-card-stack {
   position: absolute;
-  bottom: 148px;
+  bottom: calc(24px + 124px * var(--pet-scale, 1));
   right: 14px;
   display: flex;
   flex-direction: column-reverse;
   gap: 8px;
   width: min(280px, calc(100vw - 28px));
   max-width: calc(100vw - 28px);
-  max-height: calc(100vh - 180px);
-  overflow-y: auto;
   pointer-events: none;
 }
 
@@ -249,29 +264,32 @@ select {
 .menu-backdrop {
   position: absolute;
   inset: 0;
+  pointer-events: auto;
 }
 
 .context-menu {
   position: absolute;
   z-index: 10;
-  width: min(248px, calc(100vw - 24px));
+  width: min(140px, calc(100vw - 24px));
   max-width: calc(100vw - 24px);
-  max-height: min(280px, calc(100vh - 24px));
+  max-height: min(60px, calc(100vh - 24px));
   overflow: auto;
-  padding: 8px;
+  padding: 4px;
   border: 1px solid rgba(255, 255, 255, 0.12);
-  border-radius: 14px;
+  border-radius: 10px;
   background: rgba(12, 14, 18, 0.94);
-  box-shadow: 0 18px 60px rgba(0, 0, 0, 0.32);
+  box-shadow: 0 12px 40px rgba(0, 0, 0, 0.32);
+  pointer-events: auto;
 }
 
 .context-menu__item {
   width: 100%;
-  padding: 8px 10px;
+  padding: 5px 8px;
   border: 0;
-  border-radius: 10px;
+  border-radius: 7px;
   background: transparent;
   color: inherit;
+  font-size: 10.5px;
   text-align: left;
   cursor: pointer;
   overflow: hidden;
@@ -300,9 +318,27 @@ select {
 
 .settings-root {
   min-height: 100vh;
-  padding: 18px;
+  padding: 16px;
   background: #0c0f14;
   color: #eef2f7;
+  overflow-y: auto;
+}
+
+.settings-root::-webkit-scrollbar {
+  width: 8px;
+}
+
+.settings-root::-webkit-scrollbar-track {
+  background: transparent;
+}
+
+.settings-root::-webkit-scrollbar-thumb {
+  background: rgba(255, 255, 255, 0.12);
+  border-radius: 8px;
+}
+
+.settings-root::-webkit-scrollbar-thumb:hover {
+  background: rgba(255, 255, 255, 0.22);
 }
 
 .settings-header {
@@ -310,29 +346,37 @@ select {
   justify-content: space-between;
   gap: 16px;
   align-items: flex-start;
+  margin-bottom: 0;
 }
 
 .settings-header h1 {
   margin: 0;
-  font-size: 22px;
+  font-size: 17px;
 }
 
 .settings-header p {
-  margin: 6px 0 0;
-  color: rgba(255, 255, 255, 0.68);
+  margin: 5px 0 0;
+  font-size: 12px;
+  color: rgba(255, 255, 255, 0.54);
 }
 
 .settings-section {
-  margin-top: 18px;
-  padding: 16px;
+  margin-top: 14px;
+  padding: 14px;
   border: 1px solid rgba(255, 255, 255, 0.08);
   border-radius: 16px;
   background: rgba(255, 255, 255, 0.03);
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
 }
 
 .settings-section h2 {
-  margin: 0 0 14px;
-  font-size: 15px;
+  margin: 0 0 4px;
+  font-size: 13px;
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+  color: rgba(255, 255, 255, 0.54);
 }
 
 .permission-banner {
@@ -360,29 +404,29 @@ select {
 .kv-grid {
   display: grid;
   grid-template-columns: repeat(2, minmax(0, 1fr));
-  gap: 12px;
+  gap: 10px;
 }
 
 .kv-grid.compact {
-  margin-bottom: 12px;
+  margin-bottom: 0;
 }
 
 .kv {
-  padding: 12px;
-  border-radius: 12px;
+  padding: 10px;
+  border-radius: 10px;
   background: rgba(255, 255, 255, 0.04);
 }
 
 .kv__label {
   display: block;
-  font-size: 12px;
-  color: rgba(255, 255, 255, 0.58);
+  font-size: 11px;
+  color: rgba(255, 255, 255, 0.54);
 }
 
 .kv__value {
   display: block;
-  margin-top: 6px;
-  font-size: 14px;
+  margin-top: 4px;
+  font-size: 13px;
   font-weight: 600;
   word-break: break-word;
 }
@@ -391,7 +435,8 @@ select {
 .stacked-field {
   display: flex;
   flex-direction: column;
-  gap: 8px;
+  gap: 6px;
+  font-size: 13px;
 }
 
 .toggle-row {
@@ -399,21 +444,57 @@ select {
   align-items: center;
 }
 
+.toggle-row input[type="checkbox"] {
+  accent-color: #4c8dff;
+  width: 15px;
+  height: 15px;
+  cursor: pointer;
+  flex-shrink: 0;
+}
+
 .stacked-field select {
   width: 100%;
-  padding: 10px 12px;
+  padding: 8px 10px;
   border: 1px solid rgba(255, 255, 255, 0.1);
-  border-radius: 12px;
+  border-radius: 10px;
   background: rgba(255, 255, 255, 0.04);
   color: inherit;
+  font-size: 13px;
+  cursor: pointer;
+}
+
+.stacked-field input[type="range"] {
+  width: 100%;
+  height: 4px;
+  accent-color: #4c8dff;
+  cursor: pointer;
+  -webkit-appearance: none;
+  background: rgba(255, 255, 255, 0.12);
+  border-radius: 4px;
+  outline: none;
+}
+
+.stacked-field input[type="range"]::-webkit-slider-thumb {
+  -webkit-appearance: none;
+  width: 14px;
+  height: 14px;
+  border-radius: 50%;
+  background: #4c8dff;
+  cursor: pointer;
+  transition: transform 0.1s;
+}
+
+.stacked-field input[type="range"]::-webkit-slider-thumb:active {
+  transform: scale(1.2);
 }
 
 .primary-button,
 .secondary-button {
-  padding: 10px 14px;
-  border-radius: 12px;
+  padding: 8px 12px;
+  border-radius: 10px;
   border: 0;
   cursor: pointer;
+  font-size: 13px;
 }
 
 .primary-button {

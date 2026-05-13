@@ -126,6 +126,26 @@ pnpm tauri build --debug
 - **앱 이름 변경 (Claude Pet Companion → Pet Companion)**: 사용자 가시 영역은 모두 "Pet Companion"으로 변경. Bundle identifier(`com.carterp.claudepetcompanion`)와 Cargo crate 이름(`claude-pet-companion`)은 TCC 권한 / 빌드 경로 안정성을 위해 유지. 빌드 산출물 경로는 `src-tauri/target/debug/bundle/macos/Pet Companion.app`.
 - **카드 가독성 개선**: `.overlay-card` 패딩 `8px 10px` → `10px 12px`, `min-height: 64px` 추가. `.overlay-card__title` 단일행 ellipsis에서 `-webkit-line-clamp: 2` 멀티라인으로 변경. `.overlay-card__preview` line-clamp `1` → `2`. `.overlay-card-stack` gap `6px` → `8px`, width `min(232px, …)` → `min(280px, …)`.
 
+- **컨텍스트 메뉴 단순화**: 우클릭 메뉴에서 "설정 열기" 버튼 하나만 남기고 나머지(포커스, 재부착, 앱/세션 핀 선택) 항목을 전부 제거. `MENU_WIDTH` 248→140px, 폰트 12px→10.5px, 패딩 축소.
+- **캐릭터 크기 슬라이더 (pet_scale)**: `PersistedConfig.pet_scale: f32` (기본 1.0, 범위 0.5~2.0) 추가. `cmd_set_pet_scale` IPC 커맨드로 저장+emit. 오버레이 `.overlay-root`에 `--pet-scale` CSS 변수로 주입. `.pet-shell` 크기 및 `.overlay-card-stack` bottom 위치가 이 변수에 연동되고, `PetSprite`에 `transform: scale(var(--pet-scale, 1))` 적용. 설정창 `petSource` 섹션에 슬라이더 UI 추가.
+- **설정창 클릭 무반응 수정 (IPC 래퍼 미스매치 + CSS pointer-events 누수)**: 슬라이더 무반응의 근본 원인은 `cmd_set_pet_scale` 프론트 호출이 `{ scale }` 단독 전달이었으나 Rust 시그니처가 `input: PetScaleInput { scale }` 래퍼를 요구해 IPC가 무음 실패했음. `{ input: { scale } }`로 수정. 체크박스 클릭 불가는 `.overlay-root`의 `user-select: none`이 같은 CSS 번들을 쓰는 settings 창에서도 엘리먼트 선택을 방해할 수 있는 CSS 누수가 원인. `.settings-root`에 `pointer-events: auto !important` 및 `.settings-root *`에 `pointer-events: auto; user-select: auto` 명시 추가로 차단. **같은 실수 방지**: Rust 커맨드에 구조체 인자가 있을 때는 반드시 `{ input: { ... } }` 래핑 여부를 확인할 것 (기존 `SpriteInput` 미스매치 선례와 동일 패턴).
+- **오버레이 hit-test (투명 영역 click-through)**: `setIgnoreCursorEvents` 동적 토글로 투명 배경은 click-through, 인터랙티브 요소(.pet-shell, .overlay-card-stack, .context-menu, .menu-backdrop)만 마우스를 수신하도록 구현.
+  - **CSS 레이어**: `.overlay-root`에 `pointer-events: none` 기본값 설정. `.pet-shell`, `.menu-backdrop`, `.context-menu`에 `pointer-events: auto` 명시. `.overlay-card-stack > *`는 기존에 이미 `pointer-events: auto` 적용됨.
+  - **JS 경로 이중화** (`useOverlayHitTest` 훅):
+    1. **ignore=false (정상 hit-test)**: 네이티브 `mousemove` 이벤트를 수신 → `document.elementFromPoint()`로 hit 판단 → 투명 영역이면 `setIgnoreCursorEvents(true)` 전환.
+    2. **ignore=true (pass-through)**: OS가 mousemove를 삼켜 이벤트가 오지 않음 → 50ms `setInterval`로 Rust `cmd_cursor_position_in_overlay` 폴링 → 인터랙티브 요소 위에 들어오면 `setIgnoreCursorEvents(false)` 재전환 → 이후 네이티브 mousemove가 복구.
+  - **좌표계 변환 함정** (반드시 숙지):
+    - `cursor_position()` → `PhysicalPosition<f64>`: 전역 화면 물리 픽셀 (macOS의 NSScreen 좌표계, 좌상단 원점, device pixel ratio 적용됨).
+    - `outer_position()` → `PhysicalPosition<i32>`: 창 좌상단 모서리의 전역 물리 픽셀 좌표.
+    - `scale_factor()` → `f64`: Retina 디스플레이에서 2.0, 일반 디스플레이에서 1.0.
+    - **올바른 변환**: `logical_x = (cursor.x − origin.x) / scale`, `logical_y = (cursor.y − origin.y) / scale`.
+    - 이 변환 결과가 `document.elementFromPoint(x, y)`의 인자(`clientX`/`clientY` 기준 논리 픽셀)와 일치한다. **scale_factor로 나누지 않으면** Retina에서 좌표가 실제보다 2배 큰 값이 되어 hit-test가 오동작한다.
+    - **잘못된 예**: `(cursor.x − origin.x)` — scale 변환 누락 시 Retina 2배 오류.
+    - **잘못된 예**: `LogicalPosition::new(cursor.x, cursor.y)` — origin 빼지 않으면 창-로컬 좌표가 아니라 전역 좌표가 됨.
+  - **context menu 열림 시 ignore 비활성화 규칙**: `menu !== null`이면 `useOverlayHitTest(true)`로 호출되어 ignore를 강제로 false로 유지한다. 메뉴 backdrop이 화면 전체를 덮는데, ignore=true이면 backdrop 클릭이 뒤 앱 창으로 통과해서 메뉴가 닫히지 않는다. **메뉴 열림 상태에서는 반드시 ignore=false를 유지해야 한다.** 이를 위해 `useOverlayHitTest`의 `menuOpen` 파라미터를 항상 `menu !== null`로 전달한다.
+  - **Capabilities 추가**: `core:window:allow-set-ignore-cursor-events` 권한을 `src-tauri/capabilities/default.json`에 추가. 이 권한 없이는 프론트에서 `setIgnoreCursorEvents()` 호출 시 "not allowed" 오류가 발생한다.
+  - **미해결 위험 — 멀티 모니터 / 혼합 DPI**: 커서가 서로 다른 scale_factor를 가진 모니터 사이를 이동할 때, `outer_position()`과 `cursor_position()` 간의 좌표 계산에 단일 `scale_factor()`를 사용하면 좌표 오차가 발생할 수 있다. 현재 구현은 단일 scale_factor 가정이며, 멀티 모니터 혼합 DPI 환경에서는 hit-test가 약간 어긋날 수 있다. Tauri 2에서 모니터별 DPI를 가져오는 API(`MonitorHandle`)가 존재하나, 현재 단일 모니터 사용 환경에서는 충분하다.
+
 ## 작업 규칙
 
 - 컴파운드 엔지니어링을 참고해서 문제 해결한 내역이 있으면, 같은 실수를 반복하지 않도록 이 파일 또는 관련 문서에 반드시 남긴다.
