@@ -402,22 +402,26 @@ async fn cmd_set_pet_scale(
     state: State<'_, AppState>,
     input: PetScaleInput,
 ) -> Result<(), String> {
-    eprintln!("[pet_scale] received scale={}", input.scale);
     let clamped = input.scale.clamp(0.5, 2.0);
-    eprintln!("[pet_scale] clamped={}", clamped);
-    {
+    // Slider drag fires onChange at ~60Hz.  A full `refresh_and_emit` here
+    // would rescan every Claude/Codex jsonl + run JXA on each event and lock
+    // the model mutex, causing visible lag.  Instead patch the cached
+    // payload in-place and emit; no session data needs to be re-derived.
+    let patched = {
         let mut model = state.model.lock().await;
+        if (model.config.pet_scale - clamped).abs() < f32::EPSILON {
+            return Ok(());
+        }
         model.config.pet_scale = clamped;
-        persist_config(&state.config_path, &model.config).map_err(|e| {
-            eprintln!("[pet_scale] persist_config failed: {e}");
-            e
-        })?;
+        persist_config(&state.config_path, &model.config)?;
+        model.current_payload.as_mut().map(|payload| {
+            payload.config.pet_scale = clamped;
+            payload.clone()
+        })
+    };
+    if let Some(payload) = patched {
+        app.emit(APP_EVENT, payload).map_err(|e| e.to_string())?;
     }
-    refresh_and_emit(&app, &state).await.map_err(|e| {
-        eprintln!("[pet_scale] refresh_and_emit failed: {e}");
-        e
-    })?;
-    eprintln!("[pet_scale] done, scale={}", clamped);
     Ok(())
 }
 
