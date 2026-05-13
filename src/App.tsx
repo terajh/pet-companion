@@ -592,7 +592,7 @@ function isInteractivePoint(x: number, y: number): boolean {
  *     physical_cursor − physical_window_origin) / scale_factor  →  logical px
  *   This matches clientX/clientY used by elementFromPoint().
  */
-function useOverlayHitTest(menuOpen: boolean): void {
+function useOverlayHitTest(menuOpen: boolean, draggingRef: React.MutableRefObject<boolean>): void {
   useEffect(() => {
     if (windowLabel !== "overlay") return;
 
@@ -610,7 +610,13 @@ function useOverlayHitTest(menuOpen: boolean): void {
 
     // --- native mousemove path (ignore=false) ---
     const onMove = (e: MouseEvent): void => {
-      if (menuOpen) {
+      if (menuOpen || draggingRef.current) {
+        // During an active drag, IPC latency causes the window to lag a few
+        // ms behind the cursor.  In those frames the cursor's window-local
+        // clientY can fall outside the pet shell (or even go negative), at
+        // which point isInteractivePoint() returns false and we would flip
+        // to pass-through — losing pointer capture mid-drag and freezing the
+        // pet.  Force interactive while dragging.
         applyIgnore(false);
         return;
       }
@@ -626,7 +632,7 @@ function useOverlayHitTest(menuOpen: boolean): void {
     // an interactive element.
     const pollId = window.setInterval(async () => {
       if (!ignoring) return; // native mousemove path handles it
-      if (menuOpen) {
+      if (menuOpen || draggingRef.current) {
         applyIgnore(false);
         return;
       }
@@ -651,7 +657,7 @@ function useOverlayHitTest(menuOpen: boolean): void {
       window.clearInterval(pollId);
       applyIgnore(false);
     };
-  }, [menuOpen]);
+  }, [menuOpen, draggingRef]);
 }
 
 function OverlayApp() {
@@ -679,12 +685,15 @@ function OverlayApp() {
     rafId: number | null;
     pending: { sx: number; sy: number } | null;
   } | null>(null);
+  // Mirror of dragStateRef.current?.started, read by useOverlayHitTest so it
+  // can suppress pass-through transitions while a drag is active.
+  const draggingRef = useRef<boolean>(false);
   const strings = MESSAGES[payload.config.language];
 
   // Dynamic hit-test: transparent areas pass clicks through; interactive
   // elements (.pet-shell, cards, context menu) receive events normally.
   // When the context menu is open we force ignore=false so backdrop/items work.
-  useOverlayHitTest(menu !== null);
+  useOverlayHitTest(menu !== null, draggingRef);
 
   // Reset loaded state when the pet changes so the placeholder shows briefly.
   const prevPetIdRef = useRef(payload.overlay.pet.id);
@@ -753,6 +762,7 @@ function OverlayApp() {
         return;
       }
       state.started = true;
+      draggingRef.current = true;
       // Flip backend → detached BEFORE the first set_position so the 750ms
       // sync_overlay_window tick stops trying to re-anchor the overlay to the
       // tracked Claude/Codex window, which would otherwise fight every move
@@ -792,6 +802,7 @@ function OverlayApp() {
     }
     const wasDrag = state.started;
     dragStateRef.current = null;
+    draggingRef.current = false;
 
     if (!wasDrag) {
       try {
