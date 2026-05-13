@@ -69,10 +69,18 @@ cat > "$NOTES_FILE" <<EOF
 ## 변경 사항
 $CHANGE_HINTS
 
-## 설치
-1. 첨부된 \`${ZIP_NAME}.zip\` 다운로드 후 압축 해제
-2. 폴더 안의 \`install.command\` 더블클릭 → Terminal이 열리며 자동 설치
-3. 첫 실행 시 macOS가 차단하면 시스템 설정 → 개인정보 보호 및 보안에서 "그래도 열기" 선택
+## 설치 방법
+
+ad-hoc 서명 빌드라 macOS Gatekeeper가 zip을 격리(quarantine)합니다. 터미널에서 격리 해제 후 설치 스크립트를 실행하세요.
+
+\`\`\`bash
+cd ~/Downloads
+unzip -o ${ZIP_NAME}.zip
+xattr -cr ${ZIP_NAME}
+bash ${ZIP_NAME}/install.sh
+\`\`\`
+
+설치되면 \`/Applications/Pet Companion.app\`이 자동 실행됩니다. 다음 릴리즈도 동일한 방식으로 덮어쓰기 설치합니다.
 EOF
 
 # ── GitHub 릴리즈 ──────────────────────────────────

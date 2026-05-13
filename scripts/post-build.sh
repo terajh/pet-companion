@@ -21,8 +21,8 @@ rm -rf "$DIST_DIR"
 mkdir -p "$DIST_DIR/${ZIP_NAME}"
 
 cp -R "$APP_PATH" "$DIST_DIR/${ZIP_NAME}/"
-cp scripts/install.command "$DIST_DIR/${ZIP_NAME}/"
-chmod +x "$DIST_DIR/${ZIP_NAME}/install.command"
+cp scripts/install.sh "$DIST_DIR/${ZIP_NAME}/"
+chmod +x "$DIST_DIR/${ZIP_NAME}/install.sh"
 
 cd "$DIST_DIR"
 zip -r "${ZIP_NAME}.zip" "${ZIP_NAME}/"
