@@ -2079,13 +2079,16 @@ fn read_claude_session_file(path: &Path) -> Result<Option<SessionSummary>, Strin
     // Each line is an independent JSON object. We scan all lines to extract:
     //   - sessionId  (field present on most lines)
     //   - cwd        (field present on most lines)
-    //   - first user message text  → used as title
+    //   - `customTitle` from `type:"custom-title"` lines (latest wins) — this is
+    //     the human-curated title shown in Claude Desktop's session sidebar
+    //   - first user message text  → fallback title
     //   - last assistant message preview
     //   - last user message preview
     //   - lastActivityAt from the latest `timestamp` field (ISO-8601)
     //   - completedTurns = number of assistant messages
     let mut session_id: Option<String> = None;
     let mut cwd: Option<String> = None;
+    let mut custom_title: Option<String> = None;
     let mut first_user_text: Option<String> = None;
     let mut latest_user: Option<String> = None;
     let mut latest_assistant: Option<String> = None;
@@ -2119,6 +2122,16 @@ fn read_claude_session_file(path: &Path) -> Result<Option<SessionSummary>, Strin
         }
 
         let msg_type = value.get("type").and_then(Value::as_str);
+
+        // Capture user-set Claude Desktop session title.  Multiple `custom-title`
+        // lines can appear per session as the user renames; latest line wins.
+        if msg_type == Some("custom-title") {
+            if let Some(t) = value.get("customTitle").and_then(Value::as_str) {
+                if let Some(cleaned) = sanitize_preview(t) {
+                    custom_title = Some(cleaned);
+                }
+            }
+        }
 
         // Track per-role timestamps for in_progress detection.
         if let Some(ts) = value.get("timestamp").and_then(Value::as_str) {
@@ -2178,9 +2191,14 @@ fn read_claude_session_file(path: &Path) -> Result<Option<SessionSummary>, Strin
         }
     };
 
-    let title = first_user_text
+    // Title priority:
+    //   1. user-set `custom-title` (Claude Desktop sidebar label, latest line wins)
+    //   2. first user message text
+    //   3. cwd basename
+    let title = custom_title
         .clone()
         .filter(|t| !t.trim().is_empty())
+        .or_else(|| first_user_text.clone().filter(|t| !t.trim().is_empty()))
         .unwrap_or_else(|| {
             Path::new(&cwd_str)
                 .file_name()

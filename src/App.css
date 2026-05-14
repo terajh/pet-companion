@@ -239,6 +239,19 @@ select {
   line-height: 1.25;
 }
 
+.overlay-card__project {
+  display: block;
+  max-width: 100%;
+  margin-top: 1px;
+  overflow: hidden;
+  white-space: nowrap;
+  text-overflow: ellipsis;
+  color: rgba(255, 255, 255, 0.55);
+  font-size: 10px;
+  font-weight: 500;
+  letter-spacing: 0.02em;
+}
+
 .overlay-card__status {
   display: inline-flex;
   align-items: center;

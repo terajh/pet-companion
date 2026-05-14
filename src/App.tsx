@@ -458,6 +458,23 @@ function sessionPreview(
   return candidate;
 }
 
+/**
+ * Derive a short project label from a session's `cwd`.
+ * Uses the trailing path segment (basename) so the user can tell at a glance
+ * which project the session was opened against.
+ *
+ * Examples:
+ *   "/Users/carter.p/Dev/claude/works/claude-pet-companion" -> "claude-pet-companion"
+ *   "/Users/carter.p" -> "carter.p"
+ *   ""                -> null
+ */
+function projectLabel(cwd: string | null | undefined): string | null {
+  if (!cwd) return null;
+  const segments = cwd.split("/").filter((part) => part.length > 0);
+  if (segments.length === 0) return null;
+  return segments[segments.length - 1] ?? null;
+}
+
 function OverlayCard({
   onActivate,
   session,
@@ -477,6 +494,7 @@ function OverlayCard({
 }) {
   const status = stateLabel(state, language);
   const badge = appBadge(session.appKind, strings);
+  const project = projectLabel(session.cwd);
 
   return (
     <button
@@ -491,6 +509,11 @@ function OverlayCard({
           <span>{status}</span>
         </span>
       </span>
+      {project ? (
+        <span className="overlay-card__project" title={session.cwd}>
+          {project}
+        </span>
+      ) : null}
       <span className="overlay-card__title" title={session.title}>
         {session.title}
       </span>
