@@ -665,25 +665,26 @@ function OverlayApp() {
   const [menu, setMenu] = useState<ContextMenuState>(null);
   const [spriteLoaded, setSpriteLoaded] = useState(false);
   const [collapsed, setCollapsed] = useState(false);
-  // Drag state.  We replace `data-tauri-drag-region` (OS-driven drag) with a
-  // manual cursor-tracking drag because macOS's native window drag refuses to
-  // move the window above the menu bar — which prevents the pet (anchored at
-  // bottom-right of a 520×760 window) from reaching the top of the screen.
-  // The manual implementation calls `cmd_set_overlay_position(window_x,
-  // window_y)` on every pointermove (rAF-throttled), letting Rust clamp the
-  // logical window position against the active monitor's frame.
+  // Drag state.  WKWebView's `event.screenY` / `event.clientY` flip their
+  // origin between monitors (verified v0.1.26 diagnostics: screenY oscillated
+  // ±1080 across the upper-monitor boundary), so the frontend cannot compute
+  // a reliable target window position.  Instead the frontend captures only
+  // the cursor offset within the window on pointerdown, then asks Rust to
+  // take over via `cmd_begin_drag`: Rust polls `window.cursor_position()`
+  // (single global coord space) every 16 ms and writes the new logical
+  // position itself.  pointermove sends no per-frame IPC; pointerup calls
+  // `cmd_finalize_drag_position` which stops the polling loop.
   const dragStateRef = useRef<{
     // Cursor offset within the overlay window at pointerdown (in logical
-    // CSS pixels).  Maintained throughout the drag so the pet stays anchored
-    // under the cursor.
+    // CSS pixels).  Frozen for the duration of the drag and passed once to
+    // Rust via `cmd_begin_drag` so the pet stays anchored under the cursor.
     grabOffsetX: number;
     grabOffsetY: number;
-    // Initial cursor screen position (for click-vs-drag threshold).
+    // Initial cursor screen position (for click-vs-drag threshold only —
+    // not used for positioning).
     startScreenX: number;
     startScreenY: number;
     started: boolean;
-    rafId: number | null;
-    pending: { sx: number; sy: number } | null;
   } | null>(null);
   // Mirror of dragStateRef.current?.started, read by useOverlayHitTest so it
   // can suppress pass-through transitions while a drag is active.
@@ -718,22 +719,6 @@ function OverlayApp() {
 
   const DRAG_THRESHOLD = 6;
 
-  const flushPendingMove = () => {
-    const state = dragStateRef.current;
-    if (!state || !state.pending) {
-      return;
-    }
-    const { sx, sy } = state.pending;
-    state.pending = null;
-    state.rafId = null;
-    // Convert cursor screen position → desired window top-left in logical
-    // pixels.  `screenX/Y` is logical CSS pixels with primary-monitor origin
-    // on macOS, which matches Tauri's `LogicalPosition` coord space.
-    const x = Math.round(sx - state.grabOffsetX);
-    const y = Math.round(sy - state.grabOffsetY);
-    call("cmd_set_overlay_position", { input: { x, y } }).catch(console.error);
-  };
-
   const handlePointerDown = (event: React.PointerEvent<HTMLDivElement>) => {
     if (event.button !== 0) {
       return;
@@ -745,8 +730,6 @@ function OverlayApp() {
       startScreenX: event.screenX,
       startScreenY: event.screenY,
       started: false,
-      rafId: null,
-      pending: null,
     };
   };
 
@@ -763,16 +746,21 @@ function OverlayApp() {
       }
       state.started = true;
       draggingRef.current = true;
-      // Flip backend → detached BEFORE the first set_position so the 750ms
-      // sync_overlay_window tick stops trying to re-anchor the overlay to the
-      // tracked Claude/Codex window, which would otherwise fight every move
-      // and produce visible flicker locking the pet in place.
-      call("cmd_mark_detached").catch(console.error);
+      // Hand the drag off to Rust: it polls `window.cursor_position()`
+      // (single global coord space) at 16 ms intervals and writes the new
+      // window position itself, bypassing WKWebView's per-monitor screenY
+      // origin flip that caused the v0.1.25 oscillation.  Also flips
+      // `detached = true` synchronously so the 750 ms sync tick stops
+      // re-anchoring to the tracked Claude/Codex window.
+      call("cmd_begin_drag", {
+        input: {
+          grabOffsetX: state.grabOffsetX,
+          grabOffsetY: state.grabOffsetY,
+        },
+      }).catch((err) => console.error("cmd_begin_drag failed:", err));
     }
-    state.pending = { sx: event.screenX, sy: event.screenY };
-    if (state.rafId === null) {
-      state.rafId = requestAnimationFrame(flushPendingMove);
-    }
+    // Per-frame moves are intentionally NOT forwarded to Rust — the Rust
+    // cursor-polling loop handles position updates itself.
   };
 
   const handlePointerUp = async (event: React.PointerEvent<HTMLDivElement>) => {
@@ -785,21 +773,6 @@ function OverlayApp() {
     } catch {
       /* ignore — capture may have been lost */
     }
-    if (state.rafId !== null) {
-      cancelAnimationFrame(state.rafId);
-    }
-    // Apply any pending move synchronously so the final position lands
-    // before finalize.
-    if (state.pending) {
-      const { sx, sy } = state.pending;
-      const x = Math.round(sx - state.grabOffsetX);
-      const y = Math.round(sy - state.grabOffsetY);
-      try {
-        await call("cmd_set_overlay_position", { input: { x, y } });
-      } catch (error) {
-        console.error(error);
-      }
-    }
     const wasDrag = state.started;
     dragStateRef.current = null;
     draggingRef.current = false;
@@ -811,12 +784,14 @@ function OverlayApp() {
         console.error(error);
       }
     } else {
-      // Persist final position + flip detached=true + refresh payload so the
-      // frontend recomputes `cardsBelow` for the new pet location.
+      // Stops the Rust cursor-polling loop, snapshots the final position
+      // (from `window.outer_position()`), persists it, and refreshes the
+      // payload so the frontend recomputes `cardsBelow` for the new pet
+      // location.
       try {
         await call("cmd_finalize_drag_position");
       } catch (error) {
-        console.error(error);
+        console.error("cmd_finalize_drag_position failed:", error);
       }
     }
   };

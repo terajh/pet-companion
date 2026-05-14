@@ -4,7 +4,9 @@ use std::env;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Command;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
+use std::sync::Mutex as StdMutex;
 use std::time::{Duration, Instant, SystemTime};
 
 use serde::{Deserialize, Serialize};
@@ -239,6 +241,16 @@ struct RuntimeModel {
 struct AppState {
     config_path: PathBuf,
     model: Arc<Mutex<RuntimeModel>>,
+    /// Cancel signal for the cursor-polling drag loop spawned by `cmd_begin_drag`.
+    /// The loop reads this every 16 ms; `cmd_finalize_drag_position` flips it to
+    /// `true` to stop the loop.  Kept in a non-async `StdMutex` (not inside
+    /// `RuntimeModel`) so begin/finalize never have to wait on the heavy 750 ms
+    /// `refresh_and_emit` tick that holds the model lock — without this split,
+    /// begin_drag could be queued behind refresh_and_emit for >1 s, by which
+    /// time the user has already released the mouse and finalize cancels the
+    /// loop the instant it starts (root cause of the v0.1.26 "doesn't move at all"
+    /// bug).
+    drag_cancel: StdMutex<Option<Arc<AtomicBool>>>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -472,24 +484,181 @@ async fn cmd_pet_reaction(app: AppHandle, state: State<'_, AppState>) -> Result<
     Ok(())
 }
 
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct BeginDragInput {
+    /// Cursor offset within the overlay window at pointerdown, in logical CSS
+    /// pixels (i.e. `event.clientX` / `event.clientY`).  Stays constant for the
+    /// duration of the drag so the pet stays anchored under the cursor.
+    grab_offset_x: f64,
+    grab_offset_y: f64,
+}
+
+/// Starts a Rust-driven cursor-polling drag loop.  Frontend calls this exactly
+/// once when a drag is detected (pointer moved past `DRAG_THRESHOLD`); from
+/// then on Rust polls `window.cursor_position()` every 16 ms and writes the
+/// overlay position, completely bypassing WKWebView's per-monitor `event.screenY`
+/// origin flip (root cause of the v0.1.25 oscillation across the upper-monitor
+/// boundary).  The frontend no longer sends per-frame IPC at all during drag.
+///
+/// Flips `detached = true` synchronously so the 750 ms `sync_overlay_window`
+/// tick stops re-anchoring to the tracked Claude/Codex window.  Any
+/// previously-running drag loop is cancelled before the new one starts.
 #[tauri::command]
-async fn cmd_begin_drag(app: AppHandle, state: State<'_, AppState>) -> Result<(), String> {
-    // Retained for backwards compatibility; native drag is now handled by
-    // `data-tauri-drag-region` in the webview.  Calling this from a JS
-    // pointermove handler never worked on macOS because the originating
-    // mousedown event is consumed by the time the IPC reaches Rust.
+async fn cmd_begin_drag(
+    app: AppHandle,
+    state: State<'_, AppState>,
+    input: BeginDragInput,
+) -> Result<(), String> {
+    // ── Hot path: spawn the cursor-polling loop IMMEDIATELY.
+    //
+    // We must NOT await the heavy `state.model.lock()` (async RuntimeModel
+    // mutex) before spawning, because the 750 ms `sync_overlay_window` tick
+    // can hold that lock for ≥1 s mid-`refresh_and_emit`.  In v0.1.26 that
+    // caused begin_drag to stall long enough for the user to release the
+    // mouse; finalize then queued up behind begin_drag and cancelled the
+    // loop one tick after it started — pet never moved.
+    //
+    // Fix: store the cancel handle in `AppState.drag_cancel` (a `std::sync::
+    // Mutex`), not in `RuntimeModel`.  Swap is instant — no `.await`.
+    let cancel = Arc::new(AtomicBool::new(false));
     {
-        let mut model = state.model.lock().await;
-        model.config.detached = true;
-        persist_config(&state.config_path, &model.config)?;
+        let mut slot = state
+            .drag_cancel
+            .lock()
+            .map_err(|e| format!("drag_cancel poisoned: {e}"))?;
+        if let Some(prev) = slot.take() {
+            prev.store(true, Ordering::Relaxed);
+        }
+        *slot = Some(cancel.clone());
     }
 
-    if let Some(window) = app.get_webview_window(OVERLAY_WINDOW_LABEL) {
-        let _ = window.start_dragging();
-    }
+    // pet_scale is captured once at drag start to keep the hot loop free of
+    // model-lock contention.  `try_lock` avoids stalling here too — if a
+    // refresh tick happens to hold the lock right now we fall back to 1.0
+    // (matches the previous default for the first tick).
+    let pet_scale = match state.model.try_lock() {
+        Ok(model) => model.config.pet_scale,
+        Err(_) => 1.0,
+    };
 
-    refresh_and_emit(&app, &state).await?;
+    let app_for_loop = app.clone();
+    let grab_x = input.grab_offset_x;
+    let grab_y = input.grab_offset_y;
+    let cancel_for_loop = cancel.clone();
+    tauri::async_runtime::spawn(async move {
+        run_drag_cursor_loop(app_for_loop, grab_x, grab_y, pet_scale, cancel_for_loop).await;
+    });
+
+    // ── Cold path: persist `detached=true` and trigger a refresh in the
+    // background.  These can wait for the model lock without blocking the
+    // drag loop, because the loop is already running and reading the cursor.
+    let app_for_persist = app.clone();
+    tauri::async_runtime::spawn(async move {
+        let state = app_for_persist.state::<AppState>();
+        {
+            let mut model = state.model.lock().await;
+            if !model.config.detached {
+                model.config.detached = true;
+                if let Err(e) = persist_config(&state.config_path, &model.config) {
+                    eprintln!("[drag] background persist_config FAILED: {e}");
+                }
+            }
+        }
+        if let Err(e) = refresh_and_emit(&app_for_persist, &state).await {
+            eprintln!("[drag] background refresh_and_emit FAILED: {e}");
+        }
+    });
+
     Ok(())
+}
+
+/// Cursor-polling loop body. Reads `window.cursor_position()` (single
+/// global coordinate system, immune to WKWebView's per-monitor screen-coord
+/// origin flips) and writes the overlay's new logical position every 16 ms
+/// until `cancel` is flipped to `true` by `cmd_finalize_drag_position`.
+///
+/// `pet_scale` is captured once at drag start to keep this hot loop
+/// free of model-lock contention with other async tasks (e.g. refresh ticks,
+/// session focus calls).
+async fn run_drag_cursor_loop(
+    app: AppHandle,
+    grab_offset_x: f64,
+    grab_offset_y: f64,
+    pet_scale: f32,
+    cancel: Arc<AtomicBool>,
+) {
+    let mut interval = tokio::time::interval(Duration::from_millis(16));
+    interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    let mut tick_count: u64 = 0;
+    let mut cursor_err_count: u64 = 0;
+    let mut scale_err_count: u64 = 0;
+    let mut set_pos_err_count: u64 = 0;
+    let exit_reason: &str;
+    loop {
+        interval.tick().await;
+        tick_count += 1;
+        if cancel.load(Ordering::Relaxed) {
+            exit_reason = "cancel";
+            break;
+        }
+        let Some(window) = app.get_webview_window(OVERLAY_WINDOW_LABEL) else {
+            exit_reason = "window-gone";
+            break;
+        };
+        let cursor = match window.cursor_position() {
+            Ok(p) => p,
+            Err(e) => {
+                cursor_err_count += 1;
+                if cursor_err_count <= 3 || cursor_err_count % 60 == 0 {
+                    eprintln!(
+                        "[drag-loop] tick#{tick_count} cursor_position ERR ({cursor_err_count}): {e}"
+                    );
+                }
+                continue;
+            }
+        };
+        let scale = match window.scale_factor() {
+            Ok(s) => s,
+            Err(e) => {
+                scale_err_count += 1;
+                if scale_err_count <= 3 || scale_err_count % 60 == 0 {
+                    eprintln!(
+                        "[drag-loop] tick#{tick_count} scale_factor ERR ({scale_err_count}): {e}"
+                    );
+                }
+                continue;
+            }
+        };
+        // `cursor_position()` returns PhysicalPosition<f64> in the same
+        // global screen coordinate space that `set_position(LogicalPosition)`
+        // writes into (after dividing by scale).  Monitor boundary has no
+        // effect on this projection.
+        let logical_cursor_x = cursor.x / scale;
+        let logical_cursor_y = cursor.y / scale;
+        let target_x = (logical_cursor_x - grab_offset_x).round() as i32;
+        let target_y = (logical_cursor_y - grab_offset_y).round() as i32;
+        let (cx, cy) = clamp_overlay_position(&window, pet_scale, target_x, target_y);
+        if let Err(e) = window.set_position(LogicalPosition::new(cx, cy)) {
+            set_pos_err_count += 1;
+            if set_pos_err_count <= 3 || set_pos_err_count % 60 == 0 {
+                eprintln!(
+                    "[drag-loop] tick#{tick_count} set_position ERR ({set_pos_err_count}): {e}"
+                );
+            }
+        }
+    }
+    // One-shot exit line preserved — useful for diagnosing the "doesn't move"
+    // class of bug (e.g. reason=cancel with ticks=1 means the loop was
+    // cancelled the instant it spawned, as in the v0.1.26 lock-contention
+    // regression).
+    if cursor_err_count > 0 || scale_err_count > 0 || set_pos_err_count > 0 {
+        eprintln!(
+            "[drag-loop] EXIT reason={exit_reason} ticks={tick_count} cursor_errs={cursor_err_count} scale_errs={scale_err_count} set_errs={set_pos_err_count}"
+        );
+    } else {
+        eprintln!("[drag-loop] EXIT reason={exit_reason} ticks={tick_count}");
+    }
 }
 
 #[tauri::command]
@@ -549,6 +718,48 @@ struct OverlayPositionInput {
     y: i32,
 }
 
+/// One-shot at startup: lift the overlay's NSWindow level to
+/// `NSStatusWindowLevel` (25) so that subsequent `setFrameOrigin:` calls can
+/// place the window above the macOS menu bar plane.  At lower levels (Tauri's
+/// alwaysOnTop sets `NSFloatingWindowLevel` = 3) the WindowServer enforces
+/// "keep below the menu bar" — y values < ~34 snap back to 34, which is the
+/// `actual=(_,34)` symptom we saw repeatedly.
+///
+/// Performed exactly once: doing this on every drag tick raises an AppKit
+/// NSException → SIGABRT (v0.1.23 regression).
+#[cfg(target_os = "macos")]
+fn configure_overlay_window_level(app: &tauri::AppHandle) {
+    let Some(window) = app.get_webview_window(OVERLAY_WINDOW_LABEL) else {
+        eprintln!("[level] overlay window missing; skipping setLevel");
+        return;
+    };
+    let _ = app.run_on_main_thread(move || {
+        let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| unsafe {
+            use objc::runtime::Object;
+            use objc::{msg_send, sel, sel_impl};
+
+            let ns_window_ptr = window.ns_window().map_err(|e| e.to_string())?;
+            if ns_window_ptr.is_null() {
+                return Err::<(), String>("null ns_window".into());
+            }
+            let ns_window = ns_window_ptr as *mut Object;
+            let before: i64 = msg_send![ns_window, level];
+            let _: () = msg_send![ns_window, setLevel: 25_i64];
+            let after: i64 = msg_send![ns_window, level];
+            eprintln!("[level] NSWindow level {} -> {}", before, after);
+            Ok(())
+        }));
+        match outcome {
+            Ok(Ok(())) => {}
+            Ok(Err(e)) => eprintln!("[level] setLevel err: {}", e),
+            Err(_) => eprintln!("[level] setLevel PANIC caught"),
+        }
+    });
+}
+
+#[cfg(not(target_os = "macos"))]
+fn configure_overlay_window_level(_app: &tauri::AppHandle) {}
+
 /// Fast-path drag step: clamps the requested logical position against the
 /// monitor + pet_scale visual rect and writes it via `set_position` without
 /// touching the model lock or persisting config.  Frontend calls this on every
@@ -571,42 +782,23 @@ fn cmd_set_overlay_position(
         .map(|m| m.config.pet_scale)
         .unwrap_or(1.0);
     let (cx, cy) = clamp_overlay_position(&window, pet_scale, input.x, input.y);
-    // Tauri's set_position on macOS goes through NSWindow's
-    // setFrameTopLeftPoint:, which forces the title bar to remain on screen —
-    // even for borderless windows.  That snaps any y < ~34 back to y=34 and
-    // makes it impossible to drag the pet onto a monitor positioned above the
-    // primary.  Bypass via direct NSWindow setFrameOrigin: on the main thread
-    // (AppKit calls outside the main thread are silently dropped).
-    #[cfg(target_os = "macos")]
-    {
-        let window_main = window.clone();
-        let cx_f = cx as f64;
-        let cy_f = cy as f64;
-        let _ = app.run_on_main_thread(move || {
-            let result = unsafe { set_window_origin_unconstrained(&window_main, cx_f, cy_f) };
-            match result {
-                Ok(()) => {
-                    if let (Ok(phys), Ok(scale)) =
-                        (window_main.outer_position(), window_main.scale_factor())
-                    {
-                        let ax = (phys.x as f64 / scale).round() as i32;
-                        let ay = (phys.y as f64 / scale).round() as i32;
-                        eprintln!(
-                            "[set_position] objc requested=({},{}) actual=({},{})",
-                            cx, cy, ax, ay
-                        );
-                    }
-                }
-                Err(e) => {
-                    eprintln!("[set_position] objc err: {} — falling back", e);
-                    let _ = window_main.set_position(LogicalPosition::new(cx, cy));
-                }
-            }
-        });
-    }
-    #[cfg(not(target_os = "macos"))]
-    {
-        let _ = window.set_position(LogicalPosition::new(cx, cy));
+    // Drag-up strategy v0.1.25: rely on the one-shot setLevel: 25
+    // (`configure_overlay_window_level`) to lift the WindowServer "stay below
+    // menu bar" clamp, then use Tauri's regular set_position for per-tick
+    // moves.  Direct setFrameOrigin: calls on a status-level window were
+    // raising an AppKit NSException → SIGABRT (v0.1.24 regression).  Calling
+    // set_position via Tauri keeps us inside AppKit's safe path.
+    let _ = window.set_position(LogicalPosition::new(cx, cy));
+    if let (Ok(phys), Ok(scale)) = (window.outer_position(), window.scale_factor()) {
+        let ax = (phys.x as f64 / scale).round() as i32;
+        let ay = (phys.y as f64 / scale).round() as i32;
+        // Only log when the actual differs from the request — quieter logs.
+        if (ax - cx).abs() > 1 || (ay - cy).abs() > 1 {
+            eprintln!(
+                "[set_position] requested=({},{}) actual=({},{}) — clamped",
+                cx, cy, ax, ay
+            );
+        }
     }
     Ok(())
 }
@@ -618,6 +810,13 @@ fn cmd_set_overlay_position(
 /// top-left as origin and y growing downward — same convention Tauri uses for
 /// `LogicalPosition` on macOS.  Internally we convert to Cocoa's bottom-left
 /// origin where y grows upward.
+///
+/// NOTE (v0.1.25): currently UNUSED.  Calling `setFrameOrigin:` on a window
+/// whose level is `NSStatusWindowLevel` raises an AppKit NSException →
+/// SIGABRT (Rust can't catch foreign exceptions).  Kept around as a reference
+/// in case we need to revisit with `objc_exception` for proper NSException
+/// catching.
+#[allow(dead_code)]
 #[cfg(target_os = "macos")]
 unsafe fn set_window_origin_unconstrained(
     window: &tauri::WebviewWindow,
@@ -653,15 +852,14 @@ unsafe fn set_window_origin_unconstrained(
             eprintln!("[set_position] ns_window class = {:?}", cstr);
         }
         let cur_level: i64 = msg_send![ns_window, level];
-        eprintln!("[set_position] initial NSWindow level = {}", cur_level);
+        eprintln!("[set_position] live NSWindow level = {}", cur_level);
     });
 
-    // Raise window level to NSStatusWindowLevel (25) so the window sits ABOVE
-    // the menu bar plane.  At lower levels (e.g. NSFloatingWindowLevel = 3
-    // which Tauri's alwaysOnTop sets), macOS WindowServer clamps window Y so
-    // the window can't be positioned beneath/over the menu bar — exactly the
-    // "actual=(_,34)" symptom we kept seeing even after setFrameOrigin:.
-    let _: () = msg_send![ns_window, setLevel: 25_i64];
+    // NOTE: setLevel: is intentionally NOT called here.  Doing it on every
+    // 60Hz drag tick raised an AppKit NSException → SIGABRT in v0.1.23.  The
+    // window level is lifted once at startup via
+    // `configure_overlay_window_level` so subsequent setFrameOrigin: calls can
+    // place the window above the menu bar plane without WindowServer clamping.
 
     let frame: NSRect = msg_send![ns_window, frame];
     let window_height = frame.size.height;
@@ -693,6 +891,21 @@ async fn cmd_finalize_drag_position(
     app: AppHandle,
     state: State<'_, AppState>,
 ) -> Result<(), String> {
+    // Step 1: cancel the cursor-polling loop FIRST, via the non-async
+    // `drag_cancel` slot in AppState.  This is instant — no `.await` on
+    // the heavy model lock — so the loop can stop at its next tick (≤16 ms).
+    {
+        let mut slot = state
+            .drag_cancel
+            .lock()
+            .map_err(|e| format!("drag_cancel poisoned: {e}"))?;
+        if let Some(cancel) = slot.take() {
+            cancel.store(true, Ordering::Relaxed);
+        }
+    }
+
+    // Step 2: snapshot the final overlay position (also instant — pure Tauri
+    // window queries, no locks).
     let Some(window) = app.get_webview_window(OVERLAY_WINDOW_LABEL) else {
         return Ok(());
     };
@@ -703,13 +916,29 @@ async fn cmd_finalize_drag_position(
     let lx = (physical.x as f64 / scale).round() as i32;
     let ly = (physical.y as f64 / scale).round() as i32;
 
-    {
-        let mut model = state.model.lock().await;
-        model.config.detached = true;
-        model.config.detached_position = Some(SavedPosition { x: lx, y: ly });
-        persist_config(&state.config_path, &model.config)?;
-    }
-    refresh_and_emit(&app, &state).await
+    // Step 3: persist + refresh in the background.  We must not stall the
+    // IPC reply on the model lock — this is the mirror image of the fix in
+    // `cmd_begin_drag`.  Returning quickly here is harmless: the loop is
+    // already cancelled and the final position is whatever the loop last
+    // wrote to the window.
+    let app_for_persist = app.clone();
+    tauri::async_runtime::spawn(async move {
+        let state = app_for_persist.state::<AppState>();
+        {
+            let mut model = state.model.lock().await;
+            model.config.detached = true;
+            model.config.detached_position = Some(SavedPosition { x: lx, y: ly });
+            if let Err(e) = persist_config(&state.config_path, &model.config) {
+                eprintln!("[drag] finalize background persist_config FAILED: {e}");
+                return;
+            }
+        }
+        if let Err(e) = refresh_and_emit(&app_for_persist, &state).await {
+            eprintln!("[drag] finalize background refresh_and_emit FAILED: {e}");
+        }
+    });
+
+    Ok(())
 }
 
 #[tauri::command]
@@ -843,6 +1072,7 @@ pub fn run() {
         .manage(AppState {
             config_path,
             model: Arc::new(Mutex::new(runtime)),
+            drag_cancel: StdMutex::new(None),
         })
         .on_window_event(|window, event| match event {
             WindowEvent::CloseRequested { api, .. } => {
@@ -869,6 +1099,10 @@ pub fn run() {
             if let Some(window) = app.get_webview_window(OVERLAY_WINDOW_LABEL) {
                 let _ = window.show();
             }
+
+            // Lift overlay window level above the menu bar plane.  One-shot,
+            // safe; per-tick setLevel: aborted the process in v0.1.23.
+            configure_overlay_window_level(&app.handle().clone());
 
             let app_handle = app.handle().clone();
             tauri::async_runtime::spawn(async move {
@@ -2663,14 +2897,6 @@ fn clamp_overlay_position(
 
     let clamped_cx = pet_center_x.clamp(min_cx, max_cx.max(min_cx));
     let clamped_cy = pet_center_y.clamp(min_cy, max_cy.max(min_cy));
-
-    eprintln!(
-        "[clamp] in=({},{}) center=({},{}) frames={:?} union=({},{},{},{}) bounds=cx[{}..{}] cy[{}..{}] -> out=({},{})",
-        x, y, pet_center_x, pet_center_y, frames,
-        union_min_x, union_min_y, union_max_x, union_max_y,
-        min_cx, max_cx, min_cy, max_cy,
-        clamped_cx - center_offset_x, clamped_cy - center_offset_y,
-    );
 
     (
         clamped_cx - center_offset_x,
