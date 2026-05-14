@@ -1,6 +1,6 @@
 [package]
 name = "claude-pet-companion"
-version = "0.1.23"
+version = "0.1.28"
 description = "Menu bar desktop pet that follows Claude Desktop and Codex Desktop sessions"
 authors = ["carter.p"]
 edition = "2021"
