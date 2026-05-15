@@ -16,6 +16,7 @@
 import type {
   AppPayload,
   PetAnimationState,
+  SessionAppKind,
   SessionSummary,
 } from "./types";
 
@@ -60,6 +61,13 @@ const defaultClock: VisibilityClock = { now: Date.now };
  * Tied sessions are sorted by `inProgress` first, then by `lastActivityAt`
  * descending. The result is capped at MAX_VISIBLE_CARDS.
  */
+function isAppWatched(
+  appKind: SessionAppKind,
+  config: AppPayload["config"],
+): boolean {
+  return appKind === "claude" ? config.watchClaude : config.watchCodex;
+}
+
 export function pickVisibleSessions(
   payload: AppPayload,
   clock: VisibilityClock = defaultClock,
@@ -71,6 +79,10 @@ export function pickVisibleSessions(
 
   const candidates = payload.overlay.sessions.filter((session) => {
     if (session.isArchived) return false;
+    // Per-app watch toggle: unchecked apps disappear entirely from the
+    // overlay (even their active session card), so the user can focus on
+    // one assistant at a time without losing the other's session data.
+    if (!isAppWatched(session.appKind, payload.config)) return false;
     if (session.sessionId === activeId && !dismissed.has(session.sessionId)) {
       return true;
     }

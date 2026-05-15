@@ -36,10 +36,10 @@ export interface CompanionConfig {
   attached: boolean;
   language: "en" | "ko";
   trackedApp: "auto" | SessionAppKind;
-  manualSessionApp: SessionAppKind | null;
-  manualSessionId: string | null;
   petOverrideId: string | null;
   petScale: number;
+  watchClaude: boolean;
+  watchCodex: boolean;
 }
 
 export interface OverlaySnapshot {
@@ -49,8 +49,6 @@ export interface OverlaySnapshot {
   currentWindowTitle: string | null;
   effectiveState: PetAnimationState;
   messagePreview: string | null;
-  manualSessionMissing: boolean;
-  manualSessionPinned: boolean;
   permissionGranted: boolean;
   pet: PetDescriptor;
   sessions: SessionSummary[];

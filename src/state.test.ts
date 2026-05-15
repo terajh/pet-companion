@@ -44,8 +44,6 @@ function makeOverlay(overrides: Partial<OverlaySnapshot> = {}): OverlaySnapshot 
     currentWindowTitle: null,
     effectiveState: "idle",
     messagePreview: null,
-    manualSessionMissing: false,
-    manualSessionPinned: false,
     permissionGranted: true,
     pet: {
       description: "",
@@ -64,17 +62,21 @@ function makeOverlay(overrides: Partial<OverlaySnapshot> = {}): OverlaySnapshot 
   };
 }
 
-function makePayload(overlay: OverlaySnapshot): AppPayload {
+function makePayload(
+  overlay: OverlaySnapshot,
+  configOverrides: Partial<AppPayload["config"]> = {},
+): AppPayload {
   return {
     codexSelectedPetId: null,
     config: {
       attached: true,
       language: "ko",
       trackedApp: "auto",
-      manualSessionApp: null,
-      manualSessionId: null,
       petOverrideId: null,
       petScale: 1,
+      watchClaude: true,
+      watchCodex: true,
+      ...configOverrides,
     },
     overlay,
     pets: [],
@@ -412,5 +414,61 @@ describe("appKind crossover (Claude + Codex coexistence)", () => {
       "s-claude",
       "s-codex",
     ]);
+  });
+});
+
+describe("pickVisibleSessions — watch toggles per app", () => {
+  function makeBothApps() {
+    const claude = makeSession({
+      sessionId: "s-claude",
+      appKind: "claude" as SessionAppKind,
+      inProgress: true,
+    });
+    const codex = makeSession({
+      sessionId: "s-codex",
+      appKind: "codex" as SessionAppKind,
+      inProgress: true,
+    });
+    return { claude, codex };
+  }
+
+  it("hides all Claude sessions when watchClaude=false", () => {
+    const { claude, codex } = makeBothApps();
+    const overlay = makeOverlay({ sessions: [claude, codex] });
+
+    const visible = pickVisibleSessions(
+      makePayload(overlay, { watchClaude: false, watchCodex: true }),
+      fixedClock,
+    );
+
+    expect(visible.map((s) => s.sessionId)).toEqual(["s-codex"]);
+  });
+
+  it("hides all Codex sessions when watchCodex=false", () => {
+    const { claude, codex } = makeBothApps();
+    const overlay = makeOverlay({ sessions: [claude, codex] });
+
+    const visible = pickVisibleSessions(
+      makePayload(overlay, { watchClaude: true, watchCodex: false }),
+      fixedClock,
+    );
+
+    expect(visible.map((s) => s.sessionId)).toEqual(["s-claude"]);
+  });
+
+  it("returns no sessions when both watch toggles are off", () => {
+    const { claude, codex } = makeBothApps();
+    const overlay = makeOverlay({
+      sessions: [claude, codex],
+      // Even the active session must hide when its app is unwatched.
+      activeSession: claude,
+    });
+
+    const visible = pickVisibleSessions(
+      makePayload(overlay, { watchClaude: false, watchCodex: false }),
+      fixedClock,
+    );
+
+    expect(visible).toHaveLength(0);
   });
 });

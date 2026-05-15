@@ -24,10 +24,10 @@ const INITIAL_PAYLOAD: AppPayload = {
     attached: true,
     language: "ko",
     trackedApp: "auto",
-    manualSessionApp: null,
-    manualSessionId: null,
     petOverrideId: null,
     petScale: 1.0,
+    watchClaude: true,
+    watchCodex: true,
   },
   codexSelectedPetId: null,
   overlay: {
@@ -37,8 +37,6 @@ const INITIAL_PAYLOAD: AppPayload = {
     currentWindowTitle: null,
     effectiveState: "idle",
     messagePreview: null,
-    manualSessionMissing: false,
-    manualSessionPinned: false,
     permissionGranted: false,
     pet: {
       description: "",
@@ -92,21 +90,15 @@ const MESSAGES = {
     autoTrackApp: "Auto-track focused app",
     badgeClaude: "Claude",
     badgeCodex: "Codex",
-    autoFollow: "Auto-follow active session",
     autoLogin: "Launch automatically at login",
-    autoPetFollow: "Follow Codex selected custom pet automatically",
     autoPetMode: "Auto-follow Codex",
     close: "Close",
-    codexSelectedPet: "Codex selected pet",
     currentSession: "Current session",
     detached: "Detached overlay",
     effectivePet: "Effective pet",
-    fallbackMissingPin:
-      "Pinned session was missing, so companion fell back to auto-follow.",
     focusApp: "Focus app",
     language: "Language",
     manualPetOverride: "Manual pet override",
-    manualSessionOverride: "Manual session override",
     noActiveSession: "No active session",
     noCustomPet: "No custom pet",
     openPetsFolder: "Open ~/.codex/pets",
@@ -118,12 +110,15 @@ const MESSAGES = {
     permissionTitle: "Accessibility permission required",
     petSource: "Pet source",
     petState: "Pet state",
-    pinSection: "Session Pin",
     settingsSubtitle: "Menu bar pet that follows local Claude Desktop and Codex Desktop sessions.",
     startup: "Startup",
     title: "Pet Companion",
     trackClaudeOnly: "Track Claude only",
     trackCodexOnly: "Track Codex only",
+    watchClaude: "Watch Claude sessions",
+    watchCodex: "Watch Codex sessions",
+    watchSection: "Session watch",
+    autostartError: "Couldn't update login items. Allow Pet Companion under System Settings → General → Login Items.",
     windowAttached: "Attached to Claude",
   },
   ko: {
@@ -135,21 +130,15 @@ const MESSAGES = {
     autoTrackApp: "포커스된 앱 자동 추적",
     badgeClaude: "Claude",
     badgeCodex: "Codex",
-    autoFollow: "활성 세션 자동 추적",
     autoLogin: "로그인 시 자동 실행",
-    autoPetFollow: "Codex에서 선택한 커스텀 펫 자동 추종",
     autoPetMode: "Codex 자동 추종",
     close: "닫기",
-    codexSelectedPet: "Codex 선택 펫",
     currentSession: "현재 상태",
     detached: "분리 오버레이",
     effectivePet: "실제 사용 펫",
-    fallbackMissingPin:
-      "고정한 세션을 찾지 못해서 자동 추적으로 되돌렸습니다.",
     focusApp: "앱 포커스",
     language: "언어",
     manualPetOverride: "수동 펫 선택",
-    manualSessionOverride: "수동 세션 고정",
     noActiveSession: "활성 세션 없음",
     noCustomPet: "선택된 커스텀 펫 없음",
     openPetsFolder: "~/.codex/pets 열기",
@@ -161,12 +150,15 @@ const MESSAGES = {
     permissionTitle: "손쉬운 사용 권한 필요",
     petSource: "펫 소스",
     petState: "펫 상태",
-    pinSection: "세션 고정",
     settingsSubtitle: "로컬 Claude Desktop 및 Codex Desktop 세션을 따라다니는 메뉴바 펫입니다.",
     startup: "시작 설정",
     title: "Pet Companion",
     trackClaudeOnly: "Claude만 추적",
     trackCodexOnly: "Codex만 추적",
+    watchClaude: "Claude 세션 감시",
+    watchCodex: "Codex 세션 감시",
+    watchSection: "세션 감시",
+    autostartError: "로그인 항목 업데이트에 실패했습니다. 시스템 설정 → 일반 → 로그인 항목에서 Pet Companion을 허용하세요.",
     windowAttached: "Claude 창에 부착",
   },
 } as const;
@@ -218,8 +210,43 @@ function stateLabel(state: PetAnimationState, language: "en" | "ko"): string {
   return labels[language][state];
 }
 
+// How long the frontend trusts its optimistic patch over an incoming
+// `companion:update` whose config still reflects pre-spawn state.  After this
+// TTL we accept whatever the backend says, on the assumption that the spawn
+// either succeeded slowly or failed and the user has moved on.  Used for
+// both pet-override and pet-scale reconciliation.
+const PENDING_INTENT_TTL_MS = 5000;
+// Pet-scale comparisons use this epsilon — slider step is 0.1 so anything
+// within 1e-3 is effectively the same value.  Avoids floating-point near-miss
+// mismatches that would defeat the "backend caught up" branch.
+const PET_SCALE_EPSILON = 1e-3;
+
 function usePayload() {
   const [payload, setPayload] = useState<AppPayload>(INITIAL_PAYLOAD);
+  // v0.1.34: pet change revert flash fix.  Race condition:
+  //   1. User picks pet B.  `cmd_set_pet_override` synchronously emits
+  //      `companion:pet_override` with B's id → frontend optimistically
+  //      patches overlay.pet to B's descriptor.
+  //   2. The 750ms refresh tick had already started rebuilding the payload
+  //      BEFORE step 1 (or it grabs the model lock immediately after) and
+  //      reads stale `model.config.pet_override_id = A` → emits
+  //      `companion:update` with overlay.pet = A's descriptor.
+  //   3. The spawn from cmd_set_pet_override hasn't yet acquired the lock
+  //      to write pet_override_id = B.
+  // Visible symptom: pet sprite flashes back to A briefly, then returns to
+  // B once the spawn's refresh_and_emit lands.
+  //
+  // Fix: track the most recent override intent here.  When companion:update
+  // arrives whose petOverrideId doesn't match our pending intent (within
+  // TTL), patch overlay.pet from the incoming pets list using the intended
+  // id so the flash never happens.
+  const pendingOverrideRef = useRef<{ petId: string | null; ts: number } | null>(null);
+  // v0.1.35: identical race for pet_scale.  User drops slider to 0.5; the
+  // 750ms tick mid-rebuild emits a `companion:update` carrying the stale
+  // 1.0; spawn hasn't written 0.5 yet → overlay --pet-scale snaps back to
+  // 1.0 before the spawn's eventual update lands.  Reconcile here just
+  // like the override case.
+  const pendingScaleRef = useRef<{ scale: number; ts: number } | null>(null);
 
   useEffect(() => {
     let mounted = true;
@@ -231,17 +258,142 @@ function usePayload() {
       })
       .catch(console.error);
 
-    const unlistenPromise = listen<AppPayload>("companion:update", (event) => {
-      setPayload(event.payload);
+    const unlistenUpdate = listen<AppPayload>("companion:update", (event) => {
+      const incoming = event.payload;
+      let patched = incoming;
+
+      // ── Pet override reconciliation ──
+      const pendingOverride = pendingOverrideRef.current;
+      if (pendingOverride) {
+        const age = Date.now() - pendingOverride.ts;
+        if (incoming.config.petOverrideId === pendingOverride.petId) {
+          pendingOverrideRef.current = null;
+        } else if (age > PENDING_INTENT_TTL_MS) {
+          pendingOverrideRef.current = null;
+        } else {
+          // Stale snapshot — patch overlay.pet from the intended id.
+          const lookupId = pendingOverride.petId ?? incoming.codexSelectedPetId;
+          const resolved = lookupId
+            ? incoming.pets.find((pet) => pet.id === lookupId)
+            : undefined;
+          if (resolved) {
+            patched = {
+              ...patched,
+              config: { ...patched.config, petOverrideId: pendingOverride.petId },
+              overlay: { ...patched.overlay, pet: resolved },
+            };
+          }
+        }
+      }
+
+      // ── Pet scale reconciliation ──
+      const pendingScale = pendingScaleRef.current;
+      if (pendingScale) {
+        const age = Date.now() - pendingScale.ts;
+        if (Math.abs(incoming.config.petScale - pendingScale.scale) < PET_SCALE_EPSILON) {
+          pendingScaleRef.current = null;
+        } else if (age > PENDING_INTENT_TTL_MS) {
+          pendingScaleRef.current = null;
+        } else {
+          patched = {
+            ...patched,
+            config: { ...patched.config, petScale: pendingScale.scale },
+          };
+        }
+      }
+
+      setPayload(patched);
     });
+
+    // v0.1.32: lightweight pet-scale-only event.  The backend emits this
+    // synchronously inside `cmd_set_pet_scale` BEFORE acquiring the model
+    // lock, so the slider feels instantaneous even when the 750ms refresh
+    // tick is mid-rebuild.  We merge into the local payload and let the
+    // eventual `companion:update` overwrite if values diverge.
+    const unlistenScale = listen<number>("companion:pet_scale", (event) => {
+      const nextScale = event.payload;
+      pendingScaleRef.current = { scale: nextScale, ts: Date.now() };
+      setPayload((prev) =>
+        prev.config.petScale === nextScale
+          ? prev
+          : { ...prev, config: { ...prev.config, petScale: nextScale } },
+      );
+    });
+
+    // v0.1.33: same pattern as `companion:pet_scale` but for the manual
+    // pet override.  Payload is the new override id (string | null).
+    // Frontend resolves the descriptor from its local `pets` list and
+    // patches `overlay.pet` so the sprite swaps instantly.  If the id
+    // can't be resolved (e.g. auto-mode with no codex pet) we still
+    // update `config.petOverrideId` and let the eventual
+    // `companion:update` fix `overlay.pet`.
+    const unlistenOverride = listen<string | null>(
+      "companion:pet_override",
+      (event) => {
+        const nextId = event.payload;
+        pendingOverrideRef.current = { petId: nextId, ts: Date.now() };
+        setPayload((prev) => {
+          const lookupId = nextId ?? prev.codexSelectedPetId;
+          const resolved = lookupId
+            ? prev.pets.find((pet) => pet.id === lookupId)
+            : undefined;
+          const nextConfig = { ...prev.config, petOverrideId: nextId };
+          if (!resolved) {
+            return { ...prev, config: nextConfig };
+          }
+          return {
+            ...prev,
+            config: nextConfig,
+            overlay: { ...prev.overlay, pet: resolved },
+          };
+        });
+      },
+    );
 
     return () => {
       mounted = false;
-      unlistenPromise.then((fn) => fn()).catch(() => {});
+      unlistenUpdate.then((fn) => fn()).catch(() => {});
+      unlistenScale.then((fn) => fn()).catch(() => {});
+      unlistenOverride.then((fn) => fn()).catch(() => {});
     };
   }, []);
 
   return payload;
+}
+
+/**
+ * Subscribes to `companion:facing` events from the Rust drag loop.
+ * Returns the most recent drag state: `isDragging` true while a drag is
+ * active, `facingLeft` true when the cursor is moving left.  When idle
+ * the values are `{ isDragging: false, facingLeft: false }`.
+ *
+ * The hook is intentionally separate from `usePayload` because (a) it
+ * has a different lifecycle (only matters during drag), and (b) updating
+ * it doesn't need to re-emit the whole payload through React.
+ */
+function usePetFacing(): { isDragging: boolean; facingLeft: boolean } {
+  const [state, setState] = useState({ isDragging: false, facingLeft: false });
+
+  useEffect(() => {
+    if (windowLabel !== "overlay") return;
+    const unlisten = listen<{ dragging: boolean; facingLeft: boolean }>(
+      "companion:facing",
+      (event) => {
+        const { dragging, facingLeft } = event.payload;
+        setState((prev) => {
+          if (prev.isDragging === dragging && prev.facingLeft === facingLeft) {
+            return prev;
+          }
+          return { isDragging: dragging, facingLeft };
+        });
+      },
+    );
+    return () => {
+      unlisten.then((fn) => fn()).catch(() => {});
+    };
+  }, []);
+
+  return state;
 }
 
 type SpriteSheet = { src: string; naturalWidth: number; naturalHeight: number };
@@ -309,10 +461,12 @@ function PetSprite({
   pet,
   state,
   onLoaded,
+  flipHorizontal = false,
 }: {
   pet: PetDescriptor;
   state: PetAnimationState;
   onLoaded?: () => void;
+  flipHorizontal?: boolean;
 }) {
   const frame = useAnimationFrameCount(state);
   const spec = STATE_ROWS[state];
@@ -371,6 +525,10 @@ function PetSprite({
         backgroundPosition: `calc(${-frame * SPRITE_WIDTH}px * var(--pet-scale, 1)) calc(${-spec.row * SPRITE_HEIGHT}px * var(--pet-scale, 1))`,
         width: `calc(${SPRITE_WIDTH}px * var(--pet-scale, 1))`,
         height: `calc(${SPRITE_HEIGHT}px * var(--pet-scale, 1))`,
+        // Horizontal mirror for left-facing during drag.  The sprite sheet
+        // only ships a single right-facing running row (row 7), so we flip
+        // the entire element with CSS instead of swapping rows.
+        transform: flipHorizontal ? "scaleX(-1)" : undefined,
       }}
       aria-label={`${pet.displayName} ${state}`}
       role="img"
@@ -639,6 +797,11 @@ function useOverlayHitTest(menuOpen: boolean, draggingRef: React.MutableRefObjec
 
 function OverlayApp() {
   const payload = usePayload();
+  // v0.1.34: drag-direction animation.  Rust drag loop emits `companion:facing`
+  // when the cursor crosses a hysteresis threshold; we use the state here to
+  // (a) override the pet's animation to "running" while dragging and (b)
+  // mirror the sprite horizontally via CSS when the cursor is moving left.
+  const facing = usePetFacing();
   const [menu, setMenu] = useState<ContextMenuState>(null);
   const [spriteLoaded, setSpriteLoaded] = useState(false);
   const [collapsed, setCollapsed] = useState(false);
@@ -802,16 +965,17 @@ function OverlayApp() {
         />
       ) : null}
       <div
-        className={`pet-shell is-${payload.overlay.effectiveState}${spriteLoaded ? " is-loaded" : ""}`}
+        className={`pet-shell is-${facing.isDragging ? "running" : payload.overlay.effectiveState}${spriteLoaded ? " is-loaded" : ""}`}
         onDoubleClick={() => call("cmd_reattach_overlay").catch(console.error)}
         onPointerDown={handlePointerDown}
         onPointerMove={handlePointerMove}
         onPointerUp={handlePointerUp}
       >
         <PetSprite
+          flipHorizontal={facing.isDragging && facing.facingLeft}
           onLoaded={() => setSpriteLoaded(true)}
           pet={payload.overlay.pet}
-          state={payload.overlay.effectiveState}
+          state={facing.isDragging ? "running" : payload.overlay.effectiveState}
         />
         <button
           className="pet-shell__collapse-btn"
@@ -861,13 +1025,51 @@ function SettingsSection({
 function SettingsApp() {
   const payload = usePayload();
   const [autostartEnabled, setAutostartEnabled] = useState(false);
+  const [autostartError, setAutostartError] = useState<string | null>(null);
+  // Slider drag-vs-payload-echo: the IPC round-trip for cmd_set_pet_scale
+  // (lock + persist + emit + React rerender) is slow enough that a 60Hz drag
+  // sees the controlled `value` lagging by a frame or two, which makes the
+  // thumb feel sticky.  We track a local value that updates synchronously on
+  // every change event and resync from `payload.config.petScale` whenever
+  // the backend echoes a different scale (initial load, programmatic set).
+  const [localScale, setLocalScale] = useState(payload.config.petScale);
+  // Watch-toggle drag-vs-payload-echo: identical reasoning to localScale above.
+  // `cmd_set_watch_apps` triggers a full `refresh_and_emit` which is even
+  // slower than `cmd_set_pet_scale` (whole-payload rebuild including
+  // session scan).  Without a local mirror, clicking the checkbox shows the
+  // toggle revert visually until the backend echo arrives, which the user
+  // perceives as "the checkbox doesn't work."
+  const [localWatchClaude, setLocalWatchClaude] = useState(payload.config.watchClaude);
+  const [localWatchCodex, setLocalWatchCodex] = useState(payload.config.watchCodex);
+  // Single ref tracking the latest desired pair.  Each toggle handler updates
+  // this ref synchronously before firing the IPC, so the call sees the
+  // freshest values even if React has not yet rerendered after the previous
+  // setState. Without this, two rapid clicks (Claude then Codex) could ship
+  // the IPC with a stale Claude value because the Codex closure was captured
+  // from the pre-Claude-click render.
+  const watchStateRef = useRef({
+    claude: payload.config.watchClaude,
+    codex: payload.config.watchCodex,
+  });
   const strings = MESSAGES[payload.config.language];
 
   useEffect(() => {
     isEnabled().then(setAutostartEnabled).catch(() => setAutostartEnabled(false));
   }, []);
 
-  const pinnedSessionId = payload.config.manualSessionId;
+  useEffect(() => {
+    setLocalScale(payload.config.petScale);
+  }, [payload.config.petScale]);
+
+  useEffect(() => {
+    setLocalWatchClaude(payload.config.watchClaude);
+    watchStateRef.current.claude = payload.config.watchClaude;
+  }, [payload.config.watchClaude]);
+
+  useEffect(() => {
+    setLocalWatchCodex(payload.config.watchCodex);
+    watchStateRef.current.codex = payload.config.watchCodex;
+  }, [payload.config.watchCodex]);
 
   const handleAutostartChange = async (checked: boolean) => {
     try {
@@ -877,9 +1079,23 @@ function SettingsApp() {
         await disable();
       }
       setAutostartEnabled(checked);
+      setAutostartError(null);
     } catch (error) {
       console.error(error);
+      setAutostartError(strings.autostartError);
     }
+  };
+
+  const handleWatchToggle = (key: "claude" | "codex", next: boolean) => {
+    // Update ref synchronously so the IPC payload always reflects the latest
+    // user intent even if two clicks land in the same React batch.
+    watchStateRef.current = { ...watchStateRef.current, [key]: next };
+    if (key === "claude") setLocalWatchClaude(next);
+    else setLocalWatchCodex(next);
+    const { claude, codex } = watchStateRef.current;
+    call("cmd_set_watch_apps", {
+      input: { watchClaude: claude, watchCodex: codex },
+    }).catch(console.error);
   };
 
   return (
@@ -943,34 +1159,18 @@ function SettingsApp() {
         <label className="stacked-field">
           <span>{strings.language}</span>
           <select
-            onChange={(event) =>
-              call("cmd_set_language", { language: event.target.value }).catch(console.error)
-            }
+            onChange={(event) => {
+              call("cmd_set_language", { input: { language: event.target.value } }).catch(
+                console.error,
+              );
+            }}
             value={payload.config.language}
           >
             <option value="ko">한국어</option>
             <option value="en">English</option>
           </select>
         </label>
-        <label className="toggle-row">
-          <input
-            checked={payload.config.petOverrideId === null}
-            onChange={(event) => {
-              if (event.target.checked) {
-                call("cmd_set_pet_override", { petId: null }).catch(console.error);
-              } else {
-                call("cmd_set_pet_override", { petId: payload.overlay.pet.id }).catch(console.error);
-              }
-            }}
-            type="checkbox"
-          />
-          <span>{strings.autoPetFollow}</span>
-        </label>
         <div className="kv-grid compact">
-          <div className="kv">
-            <span className="kv__label">{strings.codexSelectedPet}</span>
-            <span className="kv__value">{payload.codexSelectedPetId ?? strings.noCustomPet}</span>
-          </div>
           <div className="kv">
             <span className="kv__label">{strings.effectivePet}</span>
             <span className="kv__value">{payload.overlay.pet.displayName}</span>
@@ -979,12 +1179,11 @@ function SettingsApp() {
         <label className="stacked-field">
           <span>{strings.manualPetOverride}</span>
           <select
-            disabled={payload.config.petOverrideId === null}
-            onChange={(event) =>
-              call("cmd_set_pet_override", { petId: event.target.value || null }).catch(
-                console.error,
-              )
-            }
+            onChange={(event) => {
+              call("cmd_set_pet_override", {
+                input: { petId: event.target.value || null },
+              }).catch(console.error);
+            }}
             value={payload.config.petOverrideId ?? ""}
           >
             <option value="">{strings.autoPetMode}</option>
@@ -996,16 +1195,18 @@ function SettingsApp() {
           </select>
         </label>
         <label className="stacked-field">
-          <span>{strings.petScale} ({Math.round(payload.config.petScale * 100)}%)</span>
+          <span>{strings.petScale} ({Math.round(localScale * 100)}%)</span>
           <input
             type="range"
             min="0.5"
             max="2.0"
             step="0.1"
-            value={payload.config.petScale}
-            onChange={(e) =>
-              call("cmd_set_pet_scale", { input: { scale: Number(e.target.value) } }).catch(console.error)
-            }
+            value={localScale}
+            onChange={(e) => {
+              const next = Number(e.target.value);
+              setLocalScale(next);
+              call("cmd_set_pet_scale", { input: { scale: next } }).catch(console.error);
+            }}
           />
         </label>
         <button
@@ -1017,28 +1218,23 @@ function SettingsApp() {
         </button>
       </SettingsSection>
 
-      <SettingsSection title={strings.pinSection}>
-        <label className="stacked-field">
-          <span>{strings.manualSessionOverride}</span>
-          <select
-            onChange={(event) =>
-              call("cmd_set_manual_session", {
-                sessionId: event.target.value.length > 0 ? event.target.value : null,
-              }).catch(console.error)
-            }
-            value={pinnedSessionId ?? ""}
-          >
-            <option value="">{strings.autoFollow}</option>
-            {payload.overlay.sessions.map((session) => (
-              <option key={session.sessionId} value={session.sessionId}>
-                {session.title}
-              </option>
-            ))}
-          </select>
+      <SettingsSection title={strings.watchSection}>
+        <label className="toggle-row">
+          <input
+            checked={localWatchClaude}
+            onChange={(event) => handleWatchToggle("claude", event.target.checked)}
+            type="checkbox"
+          />
+          <span>{strings.watchClaude}</span>
         </label>
-        {payload.overlay.manualSessionMissing ? (
-          <p className="notice">{strings.fallbackMissingPin}</p>
-        ) : null}
+        <label className="toggle-row">
+          <input
+            checked={localWatchCodex}
+            onChange={(event) => handleWatchToggle("codex", event.target.checked)}
+            type="checkbox"
+          />
+          <span>{strings.watchCodex}</span>
+        </label>
       </SettingsSection>
 
       <SettingsSection title={strings.startup}>
@@ -1050,6 +1246,7 @@ function SettingsApp() {
           />
           <span>{strings.autoLogin}</span>
         </label>
+        {autostartError ? <p className="notice">{autostartError}</p> : null}
       </SettingsSection>
     </div>
   );

@@ -21,6 +21,21 @@ use time::format_description::well_known::Rfc3339;
 use tokio::sync::Mutex;
 
 const APP_EVENT: &str = "companion:update";
+/// Lightweight pet-scale-only event emitted by `cmd_set_pet_scale` before the
+/// model lock is touched.  Frontend updates its local payload optimistically
+/// so the slider feels instantaneous regardless of refresh-tick contention.
+const PET_SCALE_EVENT: &str = "companion:pet_scale";
+/// Same pattern for pet override.  Payload is just the new override id (or
+/// null for auto-follow).  Frontend resolves the descriptor from its local
+/// `payload.pets` list so the overlay sprite swaps before the spawn's
+/// `refresh_and_emit` has a chance to acquire the model lock.
+const PET_OVERRIDE_EVENT: &str = "companion:pet_override";
+/// Drag facing event.  Emitted by `run_drag_cursor_loop` whenever the drag
+/// direction crosses the hysteresis threshold (and once at drag start /
+/// end).  Payload is `{ dragging: bool, facingLeft: bool }`.  Frontend
+/// switches the pet sprite to running animation and mirrors it horizontally
+/// when `facingLeft = true`.
+const FACING_EVENT: &str = "companion:facing";
 const CONFIG_FILE_NAME: &str = "config.json";
 const OVERLAY_WINDOW_LABEL: &str = "overlay";
 const SETTINGS_WINDOW_LABEL: &str = "settings";
@@ -111,8 +126,6 @@ struct OverlaySnapshot {
     current_window_title: Option<String>,
     effective_state: PetAnimationState,
     message_preview: Option<String>,
-    manual_session_missing: bool,
-    manual_session_pinned: bool,
     permission_granted: bool,
     pet: PetDescriptor,
     sessions: Vec<SessionSummary>,
@@ -133,11 +146,11 @@ struct OverlaySnapshot {
 struct FrontendConfig {
     attached: bool,
     language: String,
-    manual_session_app: Option<SessionApp>,
-    manual_session_id: Option<String>,
     pet_override_id: Option<String>,
     pet_scale: f32,
     tracked_app: String,
+    watch_claude: bool,
+    watch_codex: bool,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -164,6 +177,13 @@ struct PersistedConfig {
     tracked_app: String,
     #[serde(default = "default_pet_scale")]
     pet_scale: f32,
+    // Per-app watch toggles surface in the settings window as two
+    // checkboxes; defaulting to true matches the pre-toggle behavior
+    // so existing users see no change after upgrading.
+    #[serde(default = "default_watch_app")]
+    watch_claude: bool,
+    #[serde(default = "default_watch_app")]
+    watch_codex: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
@@ -232,7 +252,6 @@ struct RuntimeModel {
     transcript_paths: HashMap<String, PathBuf>,
     onboarding_shown: bool,
     override_animation: Option<AnimationLatch>,
-    manual_session_missing: bool,
     /// Last logical position written by sync_overlay_window / move_overlay_to_safe_home.
     /// Used by the Moved handler to distinguish programmatic repositioning from user drag.
     expected_attached_position: Option<(i32, i32)>,
@@ -251,13 +270,6 @@ struct AppState {
     /// loop the instant it starts (root cause of the v0.1.26 "doesn't move at all"
     /// bug).
     drag_cancel: StdMutex<Option<Arc<AtomicBool>>>,
-}
-
-#[derive(Debug, Deserialize)]
-#[serde(rename_all = "camelCase")]
-struct SessionSelectionInput {
-    app_kind: Option<SessionApp>,
-    session_id: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -282,6 +294,23 @@ struct TrackedAppInput {
 #[serde(rename_all = "camelCase")]
 struct PetScaleInput {
     scale: f32,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct WatchAppsInput {
+    watch_claude: bool,
+    watch_codex: bool,
+}
+
+/// Payload for `FACING_EVENT`. `dragging=false` means the pet is no longer
+/// being dragged (frontend should drop the running override and reset
+/// horizontal flip). `facing_left=true` mirrors the sprite via `scaleX(-1)`.
+#[derive(Debug, Clone, Copy, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct FacingPayload {
+    dragging: bool,
+    facing_left: bool,
 }
 
 
@@ -317,6 +346,8 @@ impl Default for PersistedConfig {
             pet_override_id: None,
             pet_scale: default_pet_scale(),
             tracked_app: default_tracked_app(),
+            watch_claude: default_watch_app(),
+            watch_codex: default_watch_app(),
         }
     }
 }
@@ -348,22 +379,6 @@ async fn cmd_show_settings(app: AppHandle) -> Result<(), String> {
 }
 
 #[tauri::command]
-async fn cmd_set_manual_session(
-    app: AppHandle,
-    state: State<'_, AppState>,
-    input: SessionSelectionInput,
-) -> Result<(), String> {
-    {
-        let mut model = state.model.lock().await;
-        model.config.manual_session_app = input.app_kind;
-        model.config.manual_session_id = input.session_id;
-        persist_config(&state.config_path, &model.config)?;
-    }
-    refresh_and_emit(&app, &state).await?;
-    Ok(())
-}
-
-#[tauri::command]
 async fn cmd_set_tracked_app(
     app: AppHandle,
     state: State<'_, AppState>,
@@ -381,15 +396,40 @@ async fn cmd_set_tracked_app(
 #[tauri::command]
 async fn cmd_set_pet_override(
     app: AppHandle,
-    state: State<'_, AppState>,
+    _state: State<'_, AppState>,
     input: PetOverrideInput,
 ) -> Result<(), String> {
-    {
-        let mut model = state.model.lock().await;
-        model.config.pet_override_id = input.pet_id;
-        persist_config(&state.config_path, &model.config)?;
-    }
-    refresh_and_emit(&app, &state).await?;
+    // v0.1.33: even v0.1.32's spawn pattern wasn't enough — the user still
+    // perceived "펫 선택이 아직 여전히 바로 반응을 안하고 있어".  Root
+    // cause: the spawned task still awaits `state.model.lock()` and can sit
+    // behind the 750ms refresh tick for hundreds of ms before
+    // `refresh_and_emit` (the heavy `rebuild_payload` + emit) fires.  Until
+    // that emit lands the overlay keeps showing the old sprite.
+    //
+    // Fix: emit `companion:pet_override` synchronously BEFORE any lock or
+    // spawn.  The frontend already holds the full `payload.pets[]` list, so
+    // it can resolve the new PetDescriptor locally and patch the overlay
+    // instantly.  The heavy work (lock + persist + refresh_and_emit) still
+    // runs in a background spawn so the IPC returns immediately and the
+    // backend eventually converges with the optimistic frontend state.
+    let pet_id = input.pet_id;
+    let _ = app.emit(PET_OVERRIDE_EVENT, pet_id.clone());
+
+    let app_clone = app.clone();
+    tauri::async_runtime::spawn(async move {
+        let state = app_clone.state::<AppState>();
+        {
+            let mut model = state.model.lock().await;
+            model.config.pet_override_id = pet_id;
+            if let Err(err) = persist_config(&state.config_path, &model.config) {
+                eprintln!("[pet_override] persist_config failed: {}", err);
+                return;
+            }
+        }
+        if let Err(err) = refresh_and_emit(&app_clone, &state).await {
+            eprintln!("[pet_override] refresh_and_emit failed: {}", err);
+        }
+    });
     Ok(())
 }
 
@@ -412,29 +452,70 @@ async fn cmd_set_language(
 #[tauri::command]
 async fn cmd_set_pet_scale(
     app: AppHandle,
-    state: State<'_, AppState>,
+    _state: State<'_, AppState>,
     input: PetScaleInput,
 ) -> Result<(), String> {
     let clamped = input.scale.clamp(0.5, 2.0);
-    // Slider drag fires onChange at ~60Hz.  A full `refresh_and_emit` here
-    // would rescan every Claude/Codex jsonl + run JXA on each event and lock
-    // the model mutex, causing visible lag.  Instead patch the cached
-    // payload in-place and emit; no session data needs to be re-derived.
-    let patched = {
+    // v0.1.32: even with v0.1.31's spawn pattern users still saw "캐릭터
+    // 크기도 바로바로 반영이 안되고 좀 시간이 지나고 반영되고 있어".  Root
+    // cause: the spawn still awaits `state.model.lock()` and can sit behind
+    // the 750ms refresh tick for hundreds of ms before the emit fires.
+    //
+    // Fix: emit a LIGHTWEIGHT `companion:pet_scale` event SYNCHRONOUSLY
+    // before any lock is touched.  The overlay listens for it and applies
+    // the scale to its local payload state immediately (no Rust round-trip
+    // on the visual response path).  The model lock + persist + payload
+    // update then run in a background spawn for state durability.
+    let _ = app.emit(PET_SCALE_EVENT, clamped);
+
+    let app_clone = app.clone();
+    tauri::async_runtime::spawn(async move {
+        let state = app_clone.state::<AppState>();
         let mut model = state.model.lock().await;
         if (model.config.pet_scale - clamped).abs() < f32::EPSILON {
-            return Ok(());
+            return;
         }
         model.config.pet_scale = clamped;
-        persist_config(&state.config_path, &model.config)?;
-        model.current_payload.as_mut().map(|payload| {
+        if let Err(err) = persist_config(&state.config_path, &model.config) {
+            eprintln!("[pet_scale] persist_config failed: {}", err);
+        }
+        if let Some(payload) = model.current_payload.as_mut() {
             payload.config.pet_scale = clamped;
-            payload.clone()
-        })
-    };
-    if let Some(payload) = patched {
-        app.emit(APP_EVENT, payload).map_err(|e| e.to_string())?;
-    }
+        }
+    });
+    Ok(())
+}
+
+#[tauri::command]
+async fn cmd_set_watch_apps(
+    app: AppHandle,
+    _state: State<'_, AppState>,
+    input: WatchAppsInput,
+) -> Result<(), String> {
+    // Same v0.1.27 model-lock invariant as cmd_set_pet_scale: avoid awaiting
+    // `state.model.lock()` on the IPC hot path because the 750ms refresh tick
+    // may be holding it through a full session scan.  Spawn the lock + persist
+    // + refresh_and_emit work to a background task so the IPC returns
+    // immediately and the checkbox feels responsive.  The local-mirror state
+    // in `SettingsApp` keeps the UI in sync until the backend echo arrives.
+    let app_clone = app.clone();
+    let watch_claude = input.watch_claude;
+    let watch_codex = input.watch_codex;
+    tauri::async_runtime::spawn(async move {
+        let state = app_clone.state::<AppState>();
+        {
+            let mut model = state.model.lock().await;
+            model.config.watch_claude = watch_claude;
+            model.config.watch_codex = watch_codex;
+            if let Err(err) = persist_config(&state.config_path, &model.config) {
+                eprintln!("[watch_apps] persist_config failed: {}", err);
+                return;
+            }
+        }
+        if let Err(err) = refresh_and_emit(&app_clone, &state).await {
+            eprintln!("[watch_apps] refresh_and_emit failed: {}", err);
+        }
+    });
     Ok(())
 }
 
@@ -560,6 +641,17 @@ async fn cmd_begin_drag(
         .map(|m| m.scale_factor())
         .unwrap_or(1.0);
 
+    // Emit initial facing state (dragging=true, facing right by default).
+    // The loop will flip `facing_left` later if the cursor moves left far
+    // enough to cross the hysteresis threshold.
+    let _ = app.emit(
+        FACING_EVENT,
+        FacingPayload {
+            dragging: true,
+            facing_left: false,
+        },
+    );
+
     let app_for_loop = app.clone();
     let grab_x = input.grab_offset_x;
     let grab_y = input.grab_offset_y;
@@ -626,6 +718,14 @@ async fn run_drag_cursor_loop(
     let mut cursor_err_count: u64 = 0;
     let mut set_pos_err_count: u64 = 0;
     let exit_reason: &str;
+    // Facing tracking: emit `companion:facing` only when the cursor direction
+    // actually flips (with a 4-logical-px hysteresis on the running anchor) so
+    // we never spam the event bus at 60Hz. `last_cursor_x` is the X coord we
+    // compared against last; `last_facing_left` is the most-recently-emitted
+    // facing. We seed `last_facing_left = false` (right-facing default).
+    let mut last_cursor_x: Option<f64> = None;
+    let mut last_facing_left: bool = false;
+    const FACING_HYSTERESIS_PX: f64 = 4.0;
     loop {
         interval.tick().await;
         tick_count += 1;
@@ -657,6 +757,37 @@ async fn run_drag_cursor_loop(
         // `set_position(LogicalPosition)` consumes.
         let logical_cursor_x = cursor.x / primary_scale;
         let logical_cursor_y = cursor.y / primary_scale;
+
+        // Facing detection runs against the logical cursor X (already in the
+        // primary-monitor coord space, immune to mixed-DPI monitor flips for
+        // the same reason as the position math above).
+        match last_cursor_x {
+            None => {
+                last_cursor_x = Some(logical_cursor_x);
+            }
+            Some(anchor) => {
+                let dx = logical_cursor_x - anchor;
+                if dx.abs() >= FACING_HYSTERESIS_PX {
+                    let next_facing_left = dx < 0.0;
+                    if next_facing_left != last_facing_left {
+                        last_facing_left = next_facing_left;
+                        let _ = app.emit(
+                            FACING_EVENT,
+                            FacingPayload {
+                                dragging: true,
+                                facing_left: next_facing_left,
+                            },
+                        );
+                    }
+                    // Re-anchor whenever we've moved past the hysteresis so
+                    // small jitter near the new anchor doesn't flip again
+                    // immediately.  Without this the user dragging gently
+                    // would oscillate at every threshold cross.
+                    last_cursor_x = Some(logical_cursor_x);
+                }
+            }
+        }
+
         let target_x = (logical_cursor_x - grab_offset_x).round() as i32;
         let target_y = (logical_cursor_y - grab_offset_y).round() as i32;
         let (cx, cy) = clamp_overlay_position(&window, pet_scale, target_x, target_y);
@@ -961,6 +1092,18 @@ async fn cmd_finalize_drag_position(
         }
     }
 
+    // Emit a terminal facing event so the frontend drops its drag-only
+    // visual state (running override + scaleX(-1) mirror).  Send this
+    // immediately — same rationale as the lightweight side-channel events
+    // for pet_scale / pet_override: must not wait on the heavy model lock.
+    let _ = app.emit(
+        FACING_EVENT,
+        FacingPayload {
+            dragging: false,
+            facing_left: false,
+        },
+    );
+
     // Step 2: snapshot the final overlay position (also instant — pure Tauri
     // window queries, no locks).
     //
@@ -1204,9 +1347,9 @@ pub fn run() {
             cmd_read_pet_sprite_data_url,
             cmd_reattach_overlay,
             cmd_set_language,
-            cmd_set_manual_session,
             cmd_set_pet_override,
             cmd_set_pet_scale,
+            cmd_set_watch_apps,
             cmd_set_tracked_app,
             cmd_show_settings,
             cmd_cursor_position_in_overlay,
@@ -1380,6 +1523,24 @@ fn rebuild_payload(model: &mut RuntimeModel, config_path: &Path) -> Result<AppPa
     // or last activity is more than 3 minutes stale.
     sessions = clear_stale_in_progress(sessions, &windows);
 
+    // v0.1.32: per-app watch filter is now enforced at the SOURCE (backend
+    // payload) instead of only at the frontend `pickVisibleSessions` step.
+    // Users reported that unchecking "Claude 세션 감시" failed to hide
+    // Claude cards in practice — the frontend filter alone could not cover
+    // every render path, and the active_session pipeline still resolved a
+    // Claude session even when the user explicitly opted out.  Dropping
+    // unwatched sessions here makes the contract authoritative: when
+    // watch_claude=false, no Claude session can become the active session,
+    // appear in the sessions list, or drive the pet sprite's state.
+    {
+        let watch_claude = model.config.watch_claude;
+        let watch_codex = model.config.watch_codex;
+        sessions.retain(|s| match s.app_kind {
+            SessionApp::Claude => watch_claude,
+            SessionApp::Codex => watch_codex,
+        });
+    }
+
     if let Some(frontmost_app) = windows.frontmost_app {
         model.last_focused_app = Some(frontmost_app);
     }
@@ -1508,11 +1669,11 @@ fn rebuild_payload(model: &mut RuntimeModel, config_path: &Path) -> Result<AppPa
         config: FrontendConfig {
             attached: !model.config.detached,
             language: normalize_language(&model.config.language).to_string(),
-            manual_session_app: model.config.manual_session_app,
-            manual_session_id: model.config.manual_session_id.clone(),
             pet_override_id: model.config.pet_override_id.clone(),
             pet_scale: model.config.pet_scale,
             tracked_app: normalize_tracked_app(&model.config.tracked_app).to_string(),
+            watch_claude: model.config.watch_claude,
+            watch_codex: model.config.watch_codex,
         },
         overlay: OverlaySnapshot {
             active_session,
@@ -1521,8 +1682,6 @@ fn rebuild_payload(model: &mut RuntimeModel, config_path: &Path) -> Result<AppPa
             current_window_title: active_window_title(&windows, model, &sessions),
             effective_state,
             message_preview,
-            manual_session_missing: model.manual_session_missing,
-            manual_session_pinned: model.config.manual_session_id.is_some(),
             permission_granted: windows.claude.permission_granted || windows.codex.permission_granted,
             pet: pet_resolution.effective_pet,
             sessions,
@@ -1548,21 +1707,6 @@ fn resolve_active_session(
     windows: &FrontWindowState,
     codex_active_roots: &[String],
 ) -> Option<SessionSummary> {
-    model.manual_session_missing = false;
-
-    if let Some(session_id) = model.config.manual_session_id.clone() {
-        let pinned_app = model.config.manual_session_app;
-        if let Some(session) = sessions.iter().find(|session| {
-            session.session_id == session_id
-                && pinned_app.map(|app| app == session.app_kind).unwrap_or(true)
-        }) {
-            return Some(session.clone());
-        }
-        model.manual_session_missing = true;
-        model.config.manual_session_app = None;
-        model.config.manual_session_id = None;
-    }
-
     let tracked_app = select_tracked_app(model, sessions, windows);
 
     if let Some(app) = tracked_app {
@@ -2033,6 +2177,10 @@ fn default_tracked_app() -> String {
 
 fn default_pet_scale() -> f32 {
     1.0
+}
+
+fn default_watch_app() -> bool {
+    true
 }
 
 fn normalize_language(language: &str) -> &'static str {
