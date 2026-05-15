@@ -331,7 +331,7 @@ dependencies = [
 
 [[package]]
 name = "claude-pet-companion"
-version = "0.1.30"
+version = "0.1.35"
 dependencies = [
  "base64 0.22.1",
  "objc",
