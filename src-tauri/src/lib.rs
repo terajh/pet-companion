@@ -542,12 +542,38 @@ async fn cmd_begin_drag(
         Err(_) => 1.0,
     };
 
+    // primary_scale is captured once and used for ALL coordinate conversions
+    // during this drag session (v0.1.30).  Rationale: tao's
+    // `window.cursor_position()` always projects through `primary_monitor()
+    // .scale_factor()` (see tao/src/platform_impl/macos/util/mod.rs —
+    // `CGDisplay::main().pixels_high()` + `primary_monitor().scale_factor()`).
+    // In contrast `window.scale_factor()` reads `NSWindow.backingScaleFactor`,
+    // which FLIPS between 2.0 and 1.0 when the window crosses a monitor
+    // boundary in a mixed-DPI setup (Retina primary + non-Retina externals).
+    // Mixing the two scales causes the cursor's logical coords to halve/double
+    // each time the window crosses the boundary, which manifests as a
+    // two-position oscillation when the user drags the pet toward the upper
+    // external monitor (the v0.1.29 user report).
+    let primary_scale = app
+        .get_webview_window(OVERLAY_WINDOW_LABEL)
+        .and_then(|w| w.primary_monitor().ok().flatten())
+        .map(|m| m.scale_factor())
+        .unwrap_or(1.0);
+
     let app_for_loop = app.clone();
     let grab_x = input.grab_offset_x;
     let grab_y = input.grab_offset_y;
     let cancel_for_loop = cancel.clone();
     tauri::async_runtime::spawn(async move {
-        run_drag_cursor_loop(app_for_loop, grab_x, grab_y, pet_scale, cancel_for_loop).await;
+        run_drag_cursor_loop(
+            app_for_loop,
+            grab_x,
+            grab_y,
+            pet_scale,
+            primary_scale,
+            cancel_for_loop,
+        )
+        .await;
     });
 
     // ── Cold path: persist `detached=true` and trigger a refresh in the
@@ -581,18 +607,23 @@ async fn cmd_begin_drag(
 /// `pet_scale` is captured once at drag start to keep this hot loop
 /// free of model-lock contention with other async tasks (e.g. refresh ticks,
 /// session focus calls).
+///
+/// `primary_scale` is captured once at drag start (see `cmd_begin_drag` for
+/// the rationale).  It must NOT be replaced with `window.scale_factor()`,
+/// which flips between monitors in mixed-DPI setups and reintroduces the
+/// v0.1.29 oscillation bug.
 async fn run_drag_cursor_loop(
     app: AppHandle,
     grab_offset_x: f64,
     grab_offset_y: f64,
     pet_scale: f32,
+    primary_scale: f64,
     cancel: Arc<AtomicBool>,
 ) {
     let mut interval = tokio::time::interval(Duration::from_millis(16));
     interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     let mut tick_count: u64 = 0;
     let mut cursor_err_count: u64 = 0;
-    let mut scale_err_count: u64 = 0;
     let mut set_pos_err_count: u64 = 0;
     let exit_reason: &str;
     loop {
@@ -618,24 +649,14 @@ async fn run_drag_cursor_loop(
                 continue;
             }
         };
-        let scale = match window.scale_factor() {
-            Ok(s) => s,
-            Err(e) => {
-                scale_err_count += 1;
-                if scale_err_count <= 3 || scale_err_count % 60 == 0 {
-                    eprintln!(
-                        "[drag-loop] tick#{tick_count} scale_factor ERR ({scale_err_count}): {e}"
-                    );
-                }
-                continue;
-            }
-        };
-        // `cursor_position()` returns PhysicalPosition<f64> in the same
-        // global screen coordinate space that `set_position(LogicalPosition)`
-        // writes into (after dividing by scale).  Monitor boundary has no
-        // effect on this projection.
-        let logical_cursor_x = cursor.x / scale;
-        let logical_cursor_y = cursor.y / scale;
+        // `cursor_position()` returns PhysicalPosition<f64> already multiplied
+        // by tao's primary_monitor scale factor (see tao's
+        // util/mod.rs::cursor_position).  Dividing by THE SAME primary scale
+        // undoes that projection exactly — yielding logical coords on the
+        // primary monitor's coordinate system, which is what
+        // `set_position(LogicalPosition)` consumes.
+        let logical_cursor_x = cursor.x / primary_scale;
+        let logical_cursor_y = cursor.y / primary_scale;
         let target_x = (logical_cursor_x - grab_offset_x).round() as i32;
         let target_y = (logical_cursor_y - grab_offset_y).round() as i32;
         let (cx, cy) = clamp_overlay_position(&window, pet_scale, target_x, target_y);
@@ -652,21 +673,36 @@ async fn run_drag_cursor_loop(
     // class of bug (e.g. reason=cancel with ticks=1 means the loop was
     // cancelled the instant it spawned, as in the v0.1.26 lock-contention
     // regression).
-    if cursor_err_count > 0 || scale_err_count > 0 || set_pos_err_count > 0 {
+    if cursor_err_count > 0 || set_pos_err_count > 0 {
         eprintln!(
-            "[drag-loop] EXIT reason={exit_reason} ticks={tick_count} cursor_errs={cursor_err_count} scale_errs={scale_err_count} set_errs={set_pos_err_count}"
+            "[drag-loop] EXIT reason={exit_reason} ticks={tick_count} cursor_errs={cursor_err_count} set_errs={set_pos_err_count}"
         );
     } else {
         eprintln!("[drag-loop] EXIT reason={exit_reason} ticks={tick_count}");
     }
 }
 
-#[tauri::command]
-async fn cmd_focus_session_by_id(
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct FocusSessionInput {
     session_id: String,
     app_kind: SessionApp,
+    /// Whether to register this session in `dismissed_sessions` so the card
+    /// hides until the session re-enters `in_progress = true`.  The frontend
+    /// decides this from the card's *visual* state (running/waiting → false;
+    /// waving/idle/jumping → true), NOT from the backend's `in_progress`
+    /// flag.  Decoupling matters because Claude's `in_progress` is computed
+    /// as `latest_user_at > latest_assistant_at` which can stay true after a
+    /// turn finishes if the .jsonl timestamps quirk; the user sees the card
+    /// as "completed" and expects a click to dismiss it. (v0.1.30)
+    dismiss: bool,
+}
+
+#[tauri::command]
+async fn cmd_focus_session_by_id(
     app: AppHandle,
     _state: State<'_, AppState>,
+    input: FocusSessionInput,
 ) -> Result<(), String> {
     // Fire the activation IMMEDIATELY on a blocking thread — no mutex, no
     // payload lookup.  The background 750ms refresh tick holds the model lock
@@ -679,8 +715,14 @@ async fn cmd_focus_session_by_id(
     // `session_meta.id`, so it can be plugged directly into the deep link.
     // Claude has no per-conversation scheme — only the cowork artifact handler
     // — so we fall back to a plain app activate.
+    let FocusSessionInput {
+        session_id,
+        app_kind,
+        dismiss,
+    } = input;
     let session_id_for_focus = session_id.clone();
-    tauri::async_runtime::spawn_blocking(move || match app_kind {
+    let app_kind_for_focus = app_kind;
+    tauri::async_runtime::spawn_blocking(move || match app_kind_for_focus {
         SessionApp::Codex => open_codex_thread(&session_id_for_focus),
         SessionApp::Claude => bring_app_forward("Claude"),
     });
@@ -690,20 +732,22 @@ async fn cmd_focus_session_by_id(
     let app_clone = app.clone();
     tauri::async_runtime::spawn(async move {
         let state = app_clone.state::<AppState>();
-        {
+        if dismiss {
             let mut model = state.model.lock().await;
-            let in_progress = model
-                .current_payload
-                .as_ref()
-                .and_then(|p| p.overlay.sessions.iter().find(|s| s.session_id == session_id))
-                .map(|s| s.in_progress)
-                .unwrap_or(false);
-            if !in_progress {
-                model.dismissed_sessions.insert(session_id.clone());
-                // A click on a "완료" card both opens the target and clears
-                // the runtime-completion marker so it stops showing.
-                model.completed_during_runtime.remove(&session_id);
-            }
+            let inserted_new = model.dismissed_sessions.insert(session_id.clone());
+            // A click on a "완료" card both opens the target and clears the
+            // runtime-completion marker so it stops showing.
+            let removed_runtime = model.completed_during_runtime.remove(&session_id);
+            eprintln!(
+                "[focus] dismiss session_id={session_id} app={:?} inserted_new={} removed_runtime={}",
+                app_kind, inserted_new, removed_runtime
+            );
+            drop(model);
+        } else {
+            eprintln!(
+                "[focus] focus-only session_id={session_id} app={:?} (in-progress card)",
+                app_kind
+            );
         }
         let _ = refresh_and_emit(&app_clone, &state).await;
     });
@@ -789,9 +833,22 @@ fn cmd_set_overlay_position(
     // raising an AppKit NSException → SIGABRT (v0.1.24 regression).  Calling
     // set_position via Tauri keeps us inside AppKit's safe path.
     let _ = window.set_position(LogicalPosition::new(cx, cy));
-    if let (Ok(phys), Ok(scale)) = (window.outer_position(), window.scale_factor()) {
-        let ax = (phys.x as f64 / scale).round() as i32;
-        let ay = (phys.y as f64 / scale).round() as i32;
+    // Diagnostic: compute the actual logical position by dividing the physical
+    // outer_position by the PRIMARY monitor's scale factor (NOT
+    // `window.scale_factor()`, which flips between monitors in mixed-DPI
+    // setups — see v0.1.30 note in CLAUDE.md).  Using the window scale here
+    // made the diag log spam "[set_position] requested=… actual=…" with bogus
+    // mirrored coords every time the user dragged across a monitor boundary,
+    // which masked real clamping events.
+    let primary_scale = window
+        .primary_monitor()
+        .ok()
+        .flatten()
+        .map(|m| m.scale_factor())
+        .unwrap_or(1.0);
+    if let Ok(phys) = window.outer_position() {
+        let ax = (phys.x as f64 / primary_scale).round() as i32;
+        let ay = (phys.y as f64 / primary_scale).round() as i32;
         // Only log when the actual differs from the request — quieter logs.
         if (ax - cx).abs() > 1 || (ay - cy).abs() > 1 {
             eprintln!(
@@ -906,15 +963,30 @@ async fn cmd_finalize_drag_position(
 
     // Step 2: snapshot the final overlay position (also instant — pure Tauri
     // window queries, no locks).
+    //
+    // v0.1.30: divide by PRIMARY monitor's scale factor, not
+    // `window.scale_factor()`.  The latter reads `NSWindow
+    // .backingScaleFactor`, which flips when the window crosses monitor
+    // boundaries.  After a drag that ended on a non-Retina external, using
+    // `window.scale_factor()` (1.0) on a `outer_position` that the
+    // WindowServer already stored in *primary*-scaled physical pixels
+    // doubles the persisted coords — which then snaps the pet to the wrong
+    // spot on the next session restore.  Match the loop's primary_scale
+    // convention so begin/loop/finalize all operate in the same coord space.
     let Some(window) = app.get_webview_window(OVERLAY_WINDOW_LABEL) else {
         return Ok(());
     };
-    let scale = window.scale_factor().unwrap_or(1.0);
+    let primary_scale = window
+        .primary_monitor()
+        .ok()
+        .flatten()
+        .map(|m| m.scale_factor())
+        .unwrap_or(1.0);
     let Ok(physical) = window.outer_position() else {
         return Ok(());
     };
-    let lx = (physical.x as f64 / scale).round() as i32;
-    let ly = (physical.y as f64 / scale).round() as i32;
+    let lx = (physical.x as f64 / primary_scale).round() as i32;
+    let ly = (physical.y as f64 / primary_scale).round() as i32;
 
     // Step 3: persist + refresh in the background.  We must not stall the
     // IPC reply on the model lock — this is the mirror image of the fix in
@@ -1319,30 +1391,14 @@ fn rebuild_payload(model: &mut RuntimeModel, config_path: &Path) -> Result<AppPa
         &codex_state.active_workspace_roots,
     );
 
-    // Prune dismissed_sessions for session ids that no longer exist.
-    let live_ids: HashSet<String> = sessions.iter().map(|s| s.session_id.clone()).collect();
-    model.dismissed_sessions.retain(|id| live_ids.contains(id));
-    model.completed_during_runtime.retain(|id| live_ids.contains(id));
-    model.prev_in_progress.retain(|id, _| live_ids.contains(id));
-
-    // Detect in_progress true→false transitions during this runtime so that
-    // such sessions are surfaced as "완료" cards until dismissed.  Sessions
-    // that were already completed at app start (no prior `true` observation)
-    // are intentionally excluded.
-    for session in &sessions {
-        let prev = model.prev_in_progress.get(&session.session_id).copied();
-        if prev == Some(true) && !session.in_progress {
-            model.completed_during_runtime.insert(session.session_id.clone());
-        }
-        if session.in_progress {
-            // A re-entry into in_progress also resets the runtime completion flag —
-            // the card will reappear after the next true→false transition.
-            model.completed_during_runtime.remove(&session.session_id);
-        }
-        model
-            .prev_in_progress
-            .insert(session.session_id.clone(), session.in_progress);
-    }
+    // Prune & detect in_progress true→false transitions in one pass.  See
+    // the function docs for the invariants this enforces.
+    update_completion_tracking(
+        &sessions,
+        &mut model.dismissed_sessions,
+        &mut model.completed_during_runtime,
+        &mut model.prev_in_progress,
+    );
 
     let turn_just_completed = detect_turn_completion(model, active_session.as_ref());
     // A turn is only "really" completed when the active session is not
@@ -1360,13 +1416,17 @@ fn rebuild_payload(model: &mut RuntimeModel, config_path: &Path) -> Result<AppPa
     let pet_resolution = resolve_pet_selection(&mut model.config, &codex_state)?;
     let base_state = compute_base_state(active_session.as_ref(), current_turn_completed);
 
-    // Lift the dismissed flag only when the session re-enters Running or
-    // Waiting state.  For Codex sessions this is signalled by in_progress=true;
-    // for Claude sessions we rely on the time-based base_state computation.
+    // v0.1.30: scope expanded from `active_session` only to all sessions so
+    // that a dismissed Codex card automatically reappears when that exact
+    // session starts a new turn — even if the user is currently focused on a
+    // different conversation.
+    lift_dismiss_on_in_progress(&sessions, &mut model.dismissed_sessions);
+    // Active-session-specific base_state lift kept as a secondary trigger so
+    // that Claude sessions whose backend `in_progress` flag is stale but
+    // whose computed `base_state` says Running/Waiting still have their
+    // dismiss flag lifted.
     if let Some(ref session) = active_session {
-        let is_running_or_waiting = session.in_progress
-            || matches!(base_state, BaseState::Running | BaseState::Waiting);
-        if is_running_or_waiting {
+        if matches!(base_state, BaseState::Running | BaseState::Waiting) {
             model.dismissed_sessions.remove(&session.session_id);
         }
     }
@@ -1594,6 +1654,62 @@ fn is_app_running(windows: &FrontWindowState, app: SessionApp) -> bool {
     match app {
         SessionApp::Claude => windows.claude_running,
         SessionApp::Codex => windows.codex_running,
+    }
+}
+
+/// Prunes runtime-state maps for session ids that no longer exist in the
+/// latest sessions list, then detects `in_progress` `true → false`
+/// transitions and updates `completed_during_runtime` so the frontend can
+/// surface a persistent "완료" card.
+///
+/// Invariants the tests in this module enforce:
+///   * A session that is observed `in_progress=true` and later observed
+///     `in_progress=false` (during the same Pet Companion run) ends up in
+///     `completed_during_runtime`.
+///   * A session that is *only* observed `in_progress=false` (never true)
+///     does NOT end up in `completed_during_runtime` — its card relies on
+///     the recency window instead.
+///   * Re-entering `in_progress=true` clears the runtime-completion marker
+///     so the next true→false transition can re-insert it.
+///   * `dismissed_sessions`, `completed_during_runtime`, and
+///     `prev_in_progress` never accumulate stale entries for session ids
+///     that have disappeared (archived, deleted on disk, etc.).
+fn update_completion_tracking(
+    sessions: &[SessionSummary],
+    dismissed_sessions: &mut HashSet<String>,
+    completed_during_runtime: &mut HashSet<String>,
+    prev_in_progress: &mut HashMap<String, bool>,
+) {
+    let live_ids: HashSet<&str> = sessions.iter().map(|s| s.session_id.as_str()).collect();
+    dismissed_sessions.retain(|id| live_ids.contains(id.as_str()));
+    completed_during_runtime.retain(|id| live_ids.contains(id.as_str()));
+    prev_in_progress.retain(|id, _| live_ids.contains(id.as_str()));
+
+    for session in sessions {
+        let prev = prev_in_progress.get(&session.session_id).copied();
+        if prev == Some(true) && !session.in_progress {
+            completed_during_runtime.insert(session.session_id.clone());
+        }
+        if session.in_progress {
+            completed_during_runtime.remove(&session.session_id);
+        }
+        prev_in_progress.insert(session.session_id.clone(), session.in_progress);
+    }
+}
+
+/// Lifts the dismissed flag for any session that is currently `in_progress=true`.
+///
+/// CLAUDE.md policy: only a `false → true` `in_progress` transition unblocks a
+/// dismissed card.  This is the per-session enforcement of that rule, applied
+/// to every session in the list (not just the active one).
+fn lift_dismiss_on_in_progress(
+    sessions: &[SessionSummary],
+    dismissed_sessions: &mut HashSet<String>,
+) {
+    for session in sessions {
+        if session.in_progress && dismissed_sessions.contains(&session.session_id) {
+            dismissed_sessions.remove(&session.session_id);
+        }
     }
 }
 
@@ -2957,3 +3073,350 @@ fn visit_matching_files(
     }
     Ok(())
 }
+
+#[cfg(test)]
+mod tests {
+    //! Unit tests for the pure state-derivation helpers used by
+    //! `rebuild_payload`.  These cover the three invariants the user-reported
+    //! "completed card disappears" regression points at:
+    //!
+    //!   1. `update_completion_tracking` correctly detects `true → false`
+    //!      `in_progress` transitions and surfaces them via
+    //!      `completed_during_runtime`.
+    //!   2. `lift_dismiss_on_in_progress` releases a dismissed card *only*
+    //!      when the same session re-enters `in_progress` — never for
+    //!      unrelated session activity.
+    //!   3. `clear_stale_in_progress` forces `in_progress=false` for stale or
+    //!      orphaned sessions, and the interaction with
+    //!      `update_completion_tracking` does NOT spuriously promote a first
+    //!      observation into the runtime-completed set.
+    //!
+    //! The fourth section documents an integration-level pitfall:
+    //! `dedup_sessions_by_workspace` can swap `session_id` mid-stream when
+    //! multiple rollout files share a `(app_kind, cwd)`, and our
+    //! prev_in_progress map keys by the *post-dedup* id.  We assert the
+    //! current behavior so a future regression in dedup ordering becomes
+    //! visible in test output.
+
+    use super::*;
+
+    fn session(id: &str, in_progress: bool, last_activity_at: u64) -> SessionSummary {
+        SessionSummary {
+            app_kind: SessionApp::Claude,
+            cli_session_id: None,
+            completed_preview: None,
+            completed_turns: None,
+            cwd: format!("/tmp/{}", id),
+            in_progress,
+            is_archived: false,
+            last_activity_at,
+            session_id: id.to_string(),
+            title: id.to_string(),
+            user_preview: None,
+            assistant_preview: None,
+        }
+    }
+
+    fn windows_both_running() -> FrontWindowState {
+        FrontWindowState {
+            claude_running: true,
+            codex_running: true,
+            ..Default::default()
+        }
+    }
+
+    fn now_ms() -> u64 {
+        SystemTime::now()
+            .duration_since(SystemTime::UNIX_EPOCH)
+            .unwrap()
+            .as_millis() as u64
+    }
+
+    // ---------- update_completion_tracking ----------
+
+    #[test]
+    fn update_completion_tracking_first_observation_does_not_mark_completed() {
+        // A session observed for the first time as `in_progress=true` must
+        // not be added to `completed_during_runtime`.  Only a *transition*
+        // from true→false counts.
+        let sessions = vec![session("s1", true, 1_000)];
+        let mut dismissed = HashSet::new();
+        let mut completed = HashSet::new();
+        let mut prev = HashMap::new();
+
+        update_completion_tracking(&sessions, &mut dismissed, &mut completed, &mut prev);
+
+        assert!(completed.is_empty(), "first observation should not mark completed");
+        assert_eq!(prev.get("s1"), Some(&true));
+    }
+
+    #[test]
+    fn update_completion_tracking_first_observation_false_does_not_mark_completed() {
+        // A session whose first observation is already `in_progress=false`
+        // must not be marked completed — we never saw the "running" phase.
+        // This is the guard against false positives on Pet Companion startup.
+        let sessions = vec![session("s1", false, 1_000)];
+        let mut dismissed = HashSet::new();
+        let mut completed = HashSet::new();
+        let mut prev = HashMap::new();
+
+        update_completion_tracking(&sessions, &mut dismissed, &mut completed, &mut prev);
+
+        assert!(completed.is_empty(), "first observation (false) must not mark completed");
+        assert_eq!(prev.get("s1"), Some(&false));
+    }
+
+    #[test]
+    fn update_completion_tracking_true_to_false_transition_marks_completed() {
+        // The headline scenario: user sees a running session, the assistant
+        // finishes, and the card must persist in "완료" state.
+        let mut dismissed = HashSet::new();
+        let mut completed = HashSet::new();
+        let mut prev = HashMap::new();
+
+        // Tick 1: in_progress = true
+        update_completion_tracking(
+            &[session("s1", true, 1_000)],
+            &mut dismissed,
+            &mut completed,
+            &mut prev,
+        );
+        assert!(completed.is_empty());
+
+        // Tick 2: in_progress = false (transition!)
+        update_completion_tracking(
+            &[session("s1", false, 2_000)],
+            &mut dismissed,
+            &mut completed,
+            &mut prev,
+        );
+        assert!(completed.contains("s1"), "true→false transition must mark completed");
+        assert_eq!(prev.get("s1"), Some(&false));
+    }
+
+    #[test]
+    fn update_completion_tracking_reenter_in_progress_clears_completed() {
+        let mut dismissed = HashSet::new();
+        let mut completed = HashSet::new();
+        let mut prev = HashMap::new();
+
+        // Build up the completed-runtime marker.
+        update_completion_tracking(&[session("s1", true, 1_000)], &mut dismissed, &mut completed, &mut prev);
+        update_completion_tracking(&[session("s1", false, 2_000)], &mut dismissed, &mut completed, &mut prev);
+        assert!(completed.contains("s1"));
+
+        // New turn starts — the runtime-completed marker must be cleared so
+        // the card flips back to "진행 중".
+        update_completion_tracking(&[session("s1", true, 3_000)], &mut dismissed, &mut completed, &mut prev);
+        assert!(!completed.contains("s1"), "re-entering in_progress must clear completed marker");
+    }
+
+    #[test]
+    fn update_completion_tracking_prunes_disappeared_sessions() {
+        let mut dismissed: HashSet<String> = vec!["gone".to_string()].into_iter().collect();
+        let mut completed: HashSet<String> = vec!["gone".to_string()].into_iter().collect();
+        let mut prev: HashMap<String, bool> = vec![("gone".to_string(), true)].into_iter().collect();
+
+        let live_sessions = vec![session("s1", true, 1_000)];
+        update_completion_tracking(&live_sessions, &mut dismissed, &mut completed, &mut prev);
+
+        assert!(!dismissed.contains("gone"), "disappeared session must be pruned from dismissed");
+        assert!(!completed.contains("gone"), "disappeared session must be pruned from completed");
+        assert!(!prev.contains_key("gone"), "disappeared session must be pruned from prev_in_progress");
+    }
+
+    #[test]
+    fn update_completion_tracking_session_id_swap_loses_prior_completion_marker() {
+        // Documents a known interaction with `dedup_sessions_by_workspace`:
+        // if a Codex workspace's rollout file rotates mid-stream, the
+        // post-dedup `session_id` changes.  The old id is pruned from
+        // `prev_in_progress`, so the *new* id starts at "first observation"
+        // and a true→false transition observed on tick 2 of the new id is
+        // detected *only if both ticks land on the same post-dedup id*.
+        //
+        // This test pins down the current behavior so a future refactor
+        // doesn't accidentally start surfacing phantom completions.
+        let mut dismissed = HashSet::new();
+        let mut completed = HashSet::new();
+        let mut prev = HashMap::new();
+
+        // Old rollout id sees in_progress=true.
+        update_completion_tracking(&[session("old-id", true, 1_000)], &mut dismissed, &mut completed, &mut prev);
+        assert_eq!(prev.get("old-id"), Some(&true));
+
+        // Next tick: dedup swapped to a new rollout id (different session_id),
+        // and the new id reports in_progress=false.
+        update_completion_tracking(&[session("new-id", false, 2_000)], &mut dismissed, &mut completed, &mut prev);
+
+        // `new-id` was never seen before — no transition can be detected.
+        // `old-id` is pruned.  Completed stays empty.
+        assert!(completed.is_empty(), "session-id swap must NOT spuriously mark completed");
+        assert!(!prev.contains_key("old-id"), "old id must be pruned");
+        assert_eq!(prev.get("new-id"), Some(&false));
+    }
+
+    // ---------- lift_dismiss_on_in_progress ----------
+
+    #[test]
+    fn lift_dismiss_only_removes_in_progress_sessions() {
+        let mut dismissed: HashSet<String> = vec!["a".to_string(), "b".to_string(), "c".to_string()]
+            .into_iter()
+            .collect();
+
+        let sessions = vec![
+            session("a", true, 1_000),   // should be lifted
+            session("b", false, 1_000),  // stays dismissed
+            session("c", false, 1_000),  // stays dismissed
+        ];
+        lift_dismiss_on_in_progress(&sessions, &mut dismissed);
+
+        assert!(!dismissed.contains("a"), "in_progress=true must lift dismiss");
+        assert!(dismissed.contains("b"), "in_progress=false must keep dismiss");
+        assert!(dismissed.contains("c"), "in_progress=false must keep dismiss");
+    }
+
+    #[test]
+    fn lift_dismiss_is_noop_when_session_not_dismissed() {
+        let mut dismissed: HashSet<String> = HashSet::new();
+        let sessions = vec![session("a", true, 1_000)];
+        lift_dismiss_on_in_progress(&sessions, &mut dismissed);
+        assert!(dismissed.is_empty());
+    }
+
+    #[test]
+    fn lift_dismiss_handles_unrelated_in_progress_correctly() {
+        // CLAUDE.md policy: only the *same* session re-entering in_progress
+        // unblocks its dismiss.  Other sessions running do not affect it.
+        let mut dismissed: HashSet<String> = vec!["dismissed-one".to_string()].into_iter().collect();
+        let sessions = vec![
+            session("dismissed-one", false, 1_000), // still completed/idle
+            session("active-other", true, 2_000),   // unrelated running session
+        ];
+        lift_dismiss_on_in_progress(&sessions, &mut dismissed);
+        assert!(
+            dismissed.contains("dismissed-one"),
+            "unrelated session running must not lift this session's dismiss"
+        );
+    }
+
+    // ---------- clear_stale_in_progress ----------
+
+    #[test]
+    fn clear_stale_in_progress_keeps_recent_running_sessions() {
+        let s = session("s1", true, now_ms()); // freshly active
+        let result = clear_stale_in_progress(vec![s], &windows_both_running());
+        assert!(result[0].in_progress, "recent in_progress must remain true");
+    }
+
+    #[test]
+    fn clear_stale_in_progress_forces_false_when_app_not_running() {
+        let s = session("s1", true, now_ms());
+        let windows = FrontWindowState {
+            claude_running: false,
+            codex_running: true,
+            ..Default::default()
+        };
+        let result = clear_stale_in_progress(vec![s], &windows);
+        assert!(!result[0].in_progress, "must force false when owning app is not running");
+    }
+
+    #[test]
+    fn clear_stale_in_progress_forces_false_when_activity_is_stale() {
+        let stale_at = now_ms().saturating_sub(4 * 60 * 1000); // 4 minutes ago
+        let s = session("s1", true, stale_at);
+        let result = clear_stale_in_progress(vec![s], &windows_both_running());
+        assert!(!result[0].in_progress, "must force false when activity is > 3 min stale");
+    }
+
+    #[test]
+    fn clear_stale_in_progress_leaves_false_sessions_alone() {
+        let s = session("s1", false, 1_000); // already idle, very old
+        let result = clear_stale_in_progress(vec![s], &windows_both_running());
+        assert!(!result[0].in_progress);
+    }
+
+    // ---------- integration: stale-clear then update_completion_tracking ----------
+
+    #[test]
+    fn first_tick_stale_session_does_not_become_runtime_completed() {
+        // Scenario: Pet Companion starts up.  The very first observation of
+        // a session is *already* stale (Pet Companion was launched after the
+        // session had been idle for >3 minutes).  The B-medium rule forces
+        // `in_progress=false`.  `update_completion_tracking` must NOT mark
+        // this as a runtime completion — we never witnessed the true phase.
+        let stale = session("s1", true, now_ms().saturating_sub(5 * 60 * 1000));
+        let after_stale = clear_stale_in_progress(vec![stale], &windows_both_running());
+        assert!(!after_stale[0].in_progress, "stale clear should have forced false");
+
+        let mut dismissed = HashSet::new();
+        let mut completed = HashSet::new();
+        let mut prev = HashMap::new();
+        update_completion_tracking(&after_stale, &mut dismissed, &mut completed, &mut prev);
+
+        assert!(
+            completed.is_empty(),
+            "first-tick stale-cleared session must not be marked completed"
+        );
+        // prev is now `false`, which is correct — we have no evidence of a
+        // running state, so a future false→false continuation does nothing.
+        assert_eq!(prev.get("s1"), Some(&false));
+    }
+
+    #[test]
+    fn observed_running_then_stale_clear_marks_completed() {
+        // Scenario: We saw the session as running (tick 1).  On tick 2 the
+        // session is now stale → B-medium forces `in_progress=false` →
+        // `update_completion_tracking` MUST detect the transition and
+        // surface a "완료" card.  This is the path that keeps the card
+        // visible after the assistant goes idle.
+        let mut dismissed = HashSet::new();
+        let mut completed = HashSet::new();
+        let mut prev = HashMap::new();
+
+        // Tick 1: running, fresh.
+        let t1 = session("s1", true, now_ms());
+        let t1_post = clear_stale_in_progress(vec![t1], &windows_both_running());
+        update_completion_tracking(&t1_post, &mut dismissed, &mut completed, &mut prev);
+        assert_eq!(prev.get("s1"), Some(&true));
+        assert!(completed.is_empty());
+
+        // Tick 2: still flagged in_progress=true on disk, but
+        // last_activity_at is now 4 minutes old → stale-clear forces false.
+        let t2 = session("s1", true, now_ms().saturating_sub(4 * 60 * 1000));
+        let t2_post = clear_stale_in_progress(vec![t2], &windows_both_running());
+        assert!(!t2_post[0].in_progress);
+        update_completion_tracking(&t2_post, &mut dismissed, &mut completed, &mut prev);
+
+        assert!(
+            completed.contains("s1"),
+            "transition (running tick → stale-cleared tick) must mark completed"
+        );
+    }
+
+    #[test]
+    fn observed_running_then_app_quit_marks_completed() {
+        // Variant of the above: Codex Desktop is force-quit mid-turn.
+        // App-not-running force-clears in_progress.  The transition must
+        // still flow into completed_during_runtime so the card stays visible.
+        let mut dismissed = HashSet::new();
+        let mut completed = HashSet::new();
+        let mut prev = HashMap::new();
+
+        let running_now = session("s1", true, now_ms());
+        let t1 = clear_stale_in_progress(vec![running_now.clone()], &windows_both_running());
+        update_completion_tracking(&t1, &mut dismissed, &mut completed, &mut prev);
+
+        // App quit.
+        let windows_app_down = FrontWindowState {
+            claude_running: false,
+            codex_running: true,
+            ..Default::default()
+        };
+        let t2 = clear_stale_in_progress(vec![running_now], &windows_app_down);
+        assert!(!t2[0].in_progress);
+        update_completion_tracking(&t2, &mut dismissed, &mut completed, &mut prev);
+
+        assert!(completed.contains("s1"));
+    }
+}
+

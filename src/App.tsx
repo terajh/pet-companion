@@ -10,6 +10,11 @@ import type {
   SessionAppKind,
   SessionSummary,
 } from "./types";
+import {
+  dismissDecisionForVisualState,
+  pickVisibleSessions,
+  sessionVisualState,
+} from "./state";
 import "./App.css";
 
 const windowLabel = getCurrentWebviewWindow().label;
@@ -373,66 +378,6 @@ function PetSprite({
   );
 }
 
-const MAX_VISIBLE_CARDS = 6;
-
-function pickVisibleSessions(payload: AppPayload): SessionSummary[] {
-  const dismissed = new Set(payload.overlay.dismissedSessionIds);
-  const completedRuntime = new Set(payload.overlay.completedRuntimeSessionIds);
-  const activeId = payload.overlay.activeSession?.sessionId ?? null;
-
-  // Visibility policy:
-  //   • the currently tracked active session: always show (the user perceives
-  //     the conversation they are chatting with as "in progress" even when
-  //     the agent is idle between turns)
-  //   • other sessions that are in_progress (running / waiting): show
-  //   • runtime-completed (was in_progress true → false during this app
-  //     session) AND not dismissed: show with "완료" label
-  //   • everything else (other idle sessions, dismissed cards): hidden
-  const candidates = payload.overlay.sessions.filter((session) => {
-    if (session.isArchived) return false;
-    if (session.sessionId === activeId && !dismissed.has(session.sessionId)) return true;
-    if (session.inProgress) return true;
-    if (dismissed.has(session.sessionId)) return false;
-    return completedRuntime.has(session.sessionId);
-  });
-
-  const sorted = [...candidates].sort((a, b) => {
-    if (a.inProgress !== b.inProgress) return a.inProgress ? -1 : 1;
-    return b.lastActivityAt - a.lastActivityAt;
-  });
-
-  // Deduplicate by sessionId in case the same id slipped through.
-  const seen = new Set<string>();
-  const unique: SessionSummary[] = [];
-  for (const session of sorted) {
-    if (seen.has(session.sessionId)) continue;
-    seen.add(session.sessionId);
-    unique.push(session);
-    if (unique.length >= MAX_VISIBLE_CARDS) break;
-  }
-  return unique;
-}
-
-function sessionVisualState(
-  session: SessionSummary,
-  payload: AppPayload,
-): PetAnimationState {
-  // For the currently-active session use the backend-computed effective state.
-  if (session.sessionId === payload.overlay.activeSession?.sessionId) {
-    return payload.overlay.effectiveState;
-  }
-  if (session.inProgress) {
-    const ageMs = Date.now() - session.lastActivityAt;
-    return ageMs > 30_000 ? "waiting" : "running";
-  }
-  // Non-progress sessions that survived the visibility filter are
-  // runtime-completed; render them with the "완료됨" waving label.
-  if (payload.overlay.completedRuntimeSessionIds.includes(session.sessionId)) {
-    return "waving";
-  }
-  return "idle";
-}
-
 function normalizeText(text: string): string {
   return text.trim().toLowerCase().replace(/\s+/g, " ");
 }
@@ -533,7 +478,11 @@ function OverlayCardStack({
 }: {
   payload: AppPayload;
   strings: Messages;
-  onActivateSession: (sessionId: string, appKind: SessionAppKind) => void;
+  onActivateSession: (
+    sessionId: string,
+    appKind: SessionAppKind,
+    visualState: PetAnimationState,
+  ) => void;
 }) {
   const visible = pickVisibleSessions(payload);
   if (visible.length === 0) return null;
@@ -544,18 +493,23 @@ function OverlayCardStack({
 
   return (
     <div className={stackClass}>
-      {visible.map((session) => (
-        <OverlayCard
-          key={session.sessionId}
-          isActive={session.sessionId === activeId}
-          language={payload.config.language}
-          onActivate={() => onActivateSession(session.sessionId, session.appKind)}
-          preview={sessionPreview(session, payload)}
-          session={session}
-          state={sessionVisualState(session, payload)}
-          strings={strings}
-        />
-      ))}
+      {visible.map((session) => {
+        const visualState = sessionVisualState(session, payload);
+        return (
+          <OverlayCard
+            key={session.sessionId}
+            isActive={session.sessionId === activeId}
+            language={payload.config.language}
+            onActivate={() =>
+              onActivateSession(session.sessionId, session.appKind, visualState)
+            }
+            preview={sessionPreview(session, payload)}
+            session={session}
+            state={visualState}
+            strings={strings}
+          />
+        );
+      })}
     </div>
   );
 }
@@ -728,10 +682,20 @@ function OverlayApp() {
     }
   }, [payload.overlay.pet.id]);
 
-  const handleActivateSession = async (sessionId?: string, appKind?: SessionAppKind) => {
+  const handleActivateSession = async (
+    sessionId?: string,
+    appKind?: SessionAppKind,
+    visualState?: PetAnimationState,
+  ) => {
     try {
       if (sessionId && appKind) {
-        await call("cmd_focus_session_by_id", { sessionId, appKind });
+        // Dismiss-on-click policy (v0.1.30): decided by VISUAL state, not by
+        // the backend's in_progress flag.  See `dismissDecisionForVisualState`
+        // for the full rationale and edge cases (Claude B-T1-R1 quirk, etc.).
+        const dismiss = dismissDecisionForVisualState(visualState ?? "idle");
+        await call("cmd_focus_session_by_id", {
+          input: { sessionId, appKind, dismiss },
+        });
       } else {
         await call("cmd_focus_active_session");
       }
