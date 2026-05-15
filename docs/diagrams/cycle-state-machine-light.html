@@ -1,0 +1,694 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>/cycle state machine light</title>
+    <style>
+      :root {
+        --bg: #f8fafc;
+        --backdrop: 
+      radial-gradient(circle at 12% 18%, rgba(56, 189, 248, 0.10), transparent 26%),
+      radial-gradient(circle at 84% 14%, rgba(167, 139, 250, 0.10), transparent 26%),
+      radial-gradient(circle at 80% 80%, rgba(52, 211, 153, 0.10), transparent 28%),
+      radial-gradient(circle at 28% 82%, rgba(251, 191, 36, 0.08), transparent 26%),
+      linear-gradient(180deg, rgba(255,255,255,0.32), rgba(255,255,255,0)),
+      #f8fafc
+    ;
+        --surface: rgba(255, 255, 255, 0.92);
+        --surface-strong: rgba(255, 255, 255, 0.98);
+        --surface-soft: rgba(241, 245, 249, 0.94);
+        --text: #0f172a;
+        --muted: #334155;
+        --subdued: #64748b;
+        --wire: #475569;
+        --wire-soft: rgba(71, 85, 105, 0.26);
+        --shadow: 0 24px 60px rgba(15, 23, 42, 0.08);
+        --title-shadow: 0 10px 22px rgba(148, 163, 184, 0.18);
+        --panel-shadow: 0 12px 28px rgba(15, 23, 42, 0.06);
+        --cyan: #0891b2;
+        --emerald: #059669;
+        --amber: #d97706;
+        --rose: #e11d48;
+        --violet: #7c3aed;
+        --neutral: #475569;
+        --gold: #b45309;
+        --slate: #334155;
+        --fill-cyan: rgba(236, 254, 255, 0.90);
+        --fill-emerald: rgba(236, 253, 245, 0.92);
+        --fill-amber: rgba(255, 247, 237, 0.92);
+        --fill-rose: rgba(255, 241, 242, 0.92);
+        --fill-violet: rgba(245, 243, 255, 0.94);
+        --fill-neutral: rgba(248, 250, 252, 0.96);
+        --fill-gold: rgba(255, 247, 237, 0.92);
+        --stop-fill: rgba(255, 255, 255, 0.98);
+        --legend-fill: rgba(255, 255, 255, 0.96);
+        --code-bg: rgba(148, 163, 184, 0.12);
+        --soft-border: rgba(148, 163, 184, 0.24);
+        --label-fill: rgba(248, 250, 252, 0.96);
+      }
+
+      * {
+        box-sizing: border-box;
+      }
+
+      html,
+      body {
+        width: 2400px;
+        height: 1400px;
+        margin: 0;
+        overflow: hidden;
+        background: var(--bg);
+      }
+
+      body {
+        font-family: -apple-system, BlinkMacSystemFont, "SF Pro Display", "Segoe UI", sans-serif;
+        color: var(--text);
+      }
+
+      .canvas {
+        position: relative;
+        width: 2400px;
+        height: 1400px;
+        background: var(--backdrop);
+      }
+
+      .title {
+        position: absolute;
+        left: 0;
+        top: 42px;
+        width: 100%;
+        text-align: center;
+        font-size: 66px;
+        font-weight: 800;
+        letter-spacing: -0.04em;
+        text-shadow: var(--title-shadow);
+      }
+
+      .subtitle {
+        position: absolute;
+        left: 0;
+        top: 124px;
+        width: 100%;
+        text-align: center;
+        font-size: 24px;
+        font-weight: 500;
+        color: var(--subdued);
+        letter-spacing: 0.01em;
+      }
+
+      .card {
+        position: absolute;
+        border-radius: 28px;
+        border: 2px solid var(--soft-border);
+        background: var(--surface);
+        box-shadow: var(--shadow);
+        padding: 24px 28px;
+        overflow: hidden;
+      }
+
+      .card::before {
+        content: "";
+        position: absolute;
+        inset: 0;
+        background:
+          linear-gradient(180deg, rgba(255,255,255,0.08), rgba(255,255,255,0)),
+          radial-gradient(circle at top right, rgba(255,255,255,0.06), transparent 28%);
+        pointer-events: none;
+      }
+
+      .entry {
+        left: 90px;
+        top: 208px;
+        width: 470px;
+        height: 132px;
+        border-color: rgba(148, 163, 184, 0.4);
+        background: var(--surface-soft);
+      }
+
+      .entry .kicker {
+        margin-bottom: 10px;
+      }
+
+      .diagnose {
+        left: 720px;
+        top: 176px;
+        width: 1020px;
+        height: 188px;
+        padding: 30px 34px;
+        border-color: color-mix(in srgb, var(--violet) 28%, var(--soft-border));
+        background:
+          radial-gradient(circle at 14% 18%, color-mix(in srgb, var(--cyan) 10%, transparent), transparent 26%),
+          radial-gradient(circle at 90% 18%, color-mix(in srgb, var(--violet) 12%, transparent), transparent 26%),
+          var(--surface-strong);
+      }
+
+      .state-a {
+        left: 790px;
+        top: 420px;
+        width: 410px;
+        height: 220px;
+        border-color: color-mix(in srgb, var(--cyan) 86%, white 4%);
+        background: var(--fill-cyan);
+      }
+
+      .state-b {
+        left: 1240px;
+        top: 420px;
+        width: 410px;
+        height: 220px;
+        border-color: color-mix(in srgb, var(--amber) 86%, white 4%);
+        background: var(--fill-amber);
+      }
+
+      .state-c {
+        left: 1690px;
+        top: 420px;
+        width: 510px;
+        height: 220px;
+        border-color: color-mix(in srgb, var(--neutral) 72%, white 12%);
+        background: var(--fill-neutral);
+      }
+
+      .state-d {
+        left: 730px;
+        top: 690px;
+        width: 780px;
+        height: 308px;
+        border-color: color-mix(in srgb, var(--emerald) 76%, white 5%);
+        background: var(--fill-emerald);
+        padding-bottom: 26px;
+      }
+
+      .state-e {
+        left: 1540px;
+        top: 724px;
+        width: 360px;
+        height: 230px;
+        border-color: color-mix(in srgb, var(--violet) 78%, white 5%);
+        background: var(--fill-violet);
+      }
+
+      .state-f {
+        left: 1940px;
+        top: 702px;
+        width: 380px;
+        height: 252px;
+        border-color: color-mix(in srgb, var(--gold) 68%, var(--emerald) 32%);
+        background:
+          linear-gradient(160deg, color-mix(in srgb, var(--fill-emerald) 44%, transparent), color-mix(in srgb, var(--fill-gold) 84%, transparent)),
+          var(--fill-gold);
+      }
+
+      .legend {
+        left: 90px;
+        top: 1010px;
+        width: 620px;
+        height: 124px;
+        border-radius: 24px;
+        background: var(--legend-fill);
+        border: 2px solid var(--soft-border);
+        box-shadow: var(--panel-shadow);
+        padding: 18px 22px;
+      }
+
+      .stop-band {
+        position: absolute;
+        left: 70px;
+        top: 1170px;
+        width: 2260px;
+        height: 168px;
+        border-radius: 28px;
+        border: 2px dashed color-mix(in srgb, var(--amber) 44%, var(--wire-soft));
+        background: var(--stop-fill);
+        box-shadow: var(--panel-shadow);
+        padding: 24px 28px;
+        display: flex;
+        align-items: center;
+        justify-content: space-between;
+        gap: 28px;
+      }
+
+      .kicker {
+        display: inline-flex;
+        align-items: center;
+        gap: 10px;
+        padding: 8px 14px;
+        border-radius: 999px;
+        border: 1px solid var(--soft-border);
+        background: color-mix(in srgb, var(--surface-strong) 72%, transparent);
+        font-size: 13px;
+        font-weight: 700;
+        letter-spacing: 0.12em;
+        text-transform: uppercase;
+        color: var(--subdued);
+      }
+
+      .main-line {
+        font-size: 34px;
+        font-weight: 800;
+        letter-spacing: -0.03em;
+        line-height: 1.15;
+      }
+
+      .diagnose .main-line {
+        font-size: 46px;
+      }
+
+      .sub-line {
+        margin-top: 8px;
+        font-size: 22px;
+        color: var(--muted);
+        line-height: 1.35;
+      }
+
+      .state-title {
+        font-size: 31px;
+        font-weight: 800;
+        letter-spacing: -0.03em;
+        line-height: 1.12;
+        margin-bottom: 14px;
+      }
+
+      .state-a .state-title { color: var(--cyan); }
+      .state-b .state-title { color: var(--amber); }
+      .state-c .state-title { color: var(--neutral); }
+      .state-d .state-title { color: var(--emerald); }
+      .state-e .state-title { color: var(--violet); }
+      .state-f .state-title {
+        background: linear-gradient(90deg, var(--emerald), var(--gold));
+        -webkit-background-clip: text;
+        background-clip: text;
+        color: transparent;
+      }
+
+      .rule {
+        height: 2px;
+        border-radius: 999px;
+        margin-bottom: 14px;
+        opacity: 0.95;
+      }
+
+      .state-a .rule { background: color-mix(in srgb, var(--cyan) 70%, transparent); }
+      .state-b .rule { background: color-mix(in srgb, var(--amber) 70%, transparent); }
+      .state-c .rule { background: color-mix(in srgb, var(--neutral) 70%, transparent); }
+      .state-d .rule { background: color-mix(in srgb, var(--emerald) 70%, transparent); }
+      .state-e .rule { background: color-mix(in srgb, var(--violet) 70%, transparent); }
+      .state-f .rule { background: linear-gradient(90deg, var(--emerald), var(--gold)); }
+
+      .action {
+        font-size: 23px;
+        font-weight: 700;
+        line-height: 1.3;
+        margin-bottom: 12px;
+        color: var(--text);
+      }
+
+      .body {
+        font-size: 20px;
+        line-height: 1.45;
+        color: var(--muted);
+      }
+
+      .mini-box {
+        margin-top: 12px;
+        padding: 12px 14px;
+        border-radius: 18px;
+        border: 1.5px solid color-mix(in srgb, currentColor 18%, var(--soft-border));
+        background: color-mix(in srgb, var(--surface-strong) 20%, transparent);
+        font-size: 18px;
+        font-weight: 650;
+        line-height: 1.4;
+      }
+
+      .exit {
+        position: absolute;
+        left: 28px;
+        right: 28px;
+        bottom: 22px;
+        padding-top: 12px;
+        border-top: 1.5px dashed var(--wire-soft);
+        font-size: 20px;
+        font-weight: 700;
+        color: var(--muted);
+      }
+
+      .code {
+        font-family: ui-monospace, "SFMono-Regular", Menlo, Monaco, Consolas, "Liberation Mono", monospace;
+        font-weight: 700;
+        letter-spacing: -0.02em;
+      }
+
+      .code-pill,
+      .flow-step,
+      .tool-pill,
+      .branch,
+      .agent-pill {
+        font-family: ui-monospace, "SFMono-Regular", Menlo, Monaco, Consolas, "Liberation Mono", monospace;
+      }
+
+      .code-pill {
+        display: inline-flex;
+        align-items: center;
+        padding: 8px 12px;
+        border-radius: 999px;
+        background: var(--code-bg);
+        border: 1px solid var(--soft-border);
+        font-size: 17px;
+        color: var(--text);
+      }
+
+      .d-layout {
+        display: grid;
+        grid-template-columns: 1fr 300px;
+        gap: 18px;
+        margin-top: 12px;
+      }
+
+      .agent-grid {
+        display: grid;
+        grid-template-columns: repeat(2, minmax(0, 1fr));
+        gap: 12px;
+        margin-top: 14px;
+      }
+
+      .agent-pill {
+        display: flex;
+        align-items: center;
+        min-height: 58px;
+        padding: 12px 14px;
+        border-radius: 18px;
+        border: 1.5px solid color-mix(in srgb, var(--emerald) 28%, var(--soft-border));
+        background: color-mix(in srgb, var(--surface-strong) 30%, transparent);
+        font-size: 16px;
+        font-weight: 700;
+        line-height: 1.35;
+        color: var(--text);
+      }
+
+      .branch-stack {
+        display: flex;
+        flex-direction: column;
+        gap: 12px;
+        padding-left: 4px;
+      }
+
+      .branch {
+        min-height: 74px;
+        border-radius: 20px;
+        border: 1.5px solid var(--soft-border);
+        padding: 12px 14px;
+        display: flex;
+        align-items: center;
+        gap: 12px;
+        font-size: 16px;
+        font-weight: 700;
+        line-height: 1.35;
+        color: var(--text);
+      }
+
+      .branch .branch-id {
+        min-width: 50px;
+        padding: 8px 10px;
+        border-radius: 999px;
+        text-align: center;
+        font-size: 14px;
+        letter-spacing: 0.04em;
+        background: color-mix(in srgb, var(--surface-strong) 78%, transparent);
+      }
+
+      .branch.rose {
+        border-color: color-mix(in srgb, var(--rose) 46%, var(--soft-border));
+        background: color-mix(in srgb, var(--rose) 14%, transparent);
+      }
+
+      .branch.violet {
+        border-color: color-mix(in srgb, var(--violet) 46%, var(--soft-border));
+        background: color-mix(in srgb, var(--violet) 14%, transparent);
+      }
+
+      .branch.emerald {
+        border-color: color-mix(in srgb, var(--emerald) 46%, var(--soft-border));
+        background: color-mix(in srgb, var(--emerald) 14%, transparent);
+      }
+
+      .legend-title {
+        font-size: 18px;
+        font-weight: 800;
+        letter-spacing: 0.08em;
+        text-transform: uppercase;
+        color: var(--subdued);
+        margin-bottom: 12px;
+      }
+
+      .legend-grid {
+        display: grid;
+        grid-template-columns: 1fr 1fr;
+        gap: 10px 20px;
+      }
+
+      .legend-item {
+        display: flex;
+        align-items: center;
+        gap: 12px;
+        font-size: 18px;
+        color: var(--muted);
+      }
+
+      .legend-symbol {
+        width: 34px;
+        height: 34px;
+        border-radius: 10px;
+        border: 1.5px solid var(--soft-border);
+        display: inline-flex;
+        align-items: center;
+        justify-content: center;
+        font-size: 18px;
+        background: var(--surface-strong);
+        color: var(--text);
+        flex: 0 0 auto;
+      }
+
+      .stop-copy {
+        min-width: 0;
+      }
+
+      .stop-title {
+        font-size: 31px;
+        font-weight: 800;
+        line-height: 1.15;
+        letter-spacing: -0.03em;
+        color: var(--text);
+      }
+
+      .stop-subtitle {
+        margin-top: 6px;
+        font-size: 21px;
+        color: var(--muted);
+      }
+
+      .flow {
+        display: flex;
+        align-items: center;
+        gap: 14px;
+        flex-wrap: nowrap;
+      }
+
+      .flow-step {
+        display: inline-flex;
+        align-items: center;
+        padding: 12px 16px;
+        border-radius: 16px;
+        border: 1.5px solid var(--soft-border);
+        background: var(--surface-soft);
+        font-size: 18px;
+        font-weight: 700;
+        color: var(--text);
+      }
+
+      .flow-arrow {
+        font-size: 30px;
+        color: var(--subdued);
+      }
+
+      .flow-note {
+        font-size: 17px;
+        color: var(--subdued);
+      }
+
+      .label-chip {
+        fill: var(--label-fill);
+        stroke: var(--soft-border);
+        stroke-width: 1.5;
+      }
+
+      .wire-label {
+        font-size: 18px;
+        font-weight: 700;
+        fill: var(--muted);
+      }
+
+      .wire-label.small {
+        font-size: 16px;
+      }
+
+      .wire-label.code {
+        font-family: ui-monospace, "SFMono-Regular", Menlo, Monaco, Consolas, "Liberation Mono", monospace;
+      }
+
+      svg.wires {
+        position: absolute;
+        inset: 0;
+        width: 2400px;
+        height: 1400px;
+        overflow: visible;
+        pointer-events: none;
+      }
+    </style>
+  </head>
+  <body>
+    <div class="canvas">
+      <div class="title"><span class="code">/cycle</span> - pet-companion harness orchestrator</div>
+      <div class="subtitle">one command per human gate · runs as far as possible · stops to wait for code edits or approvals</div>
+
+      <div class="card entry">
+        <div class="kicker">Entry Point</div>
+        <div class="main-line">User invokes <span class="code">/cycle</span> [arg?]</div>
+      </div>
+
+      <div class="card diagnose">
+        <div class="kicker">State Probe</div>
+        <div class="main-line">📊 Diagnose</div>
+        <div class="sub-line">active plans? uncommitted? args?</div>
+      </div>
+
+      <div class="card state-a">
+        <div class="state-title">🆕 State A: New work</div>
+        <div class="rule"></div>
+        <div class="action">Run <span class="code">/plan</span> flow</div>
+        <div class="mini-box">brainstorming → writing-plans → atomic tasks</div>
+        <div class="exit">→ Stop. User edits code.</div>
+      </div>
+
+      <div class="card state-b">
+        <div class="state-title">⚠️ State B: Orphan changes</div>
+        <div class="rule"></div>
+        <div class="action">Notify user. Suggest <span class="code">/review</span> or <span class="code">/cycle "title"</span></div>
+        <div class="exit">→ Stop</div>
+      </div>
+
+      <div class="card state-c">
+        <div class="state-title">📝 State C: Plan ready</div>
+        <div class="rule"></div>
+        <div class="action">Remind user to start TodoWrite tasks</div>
+        <div class="exit">→ Stop</div>
+      </div>
+
+      <div class="card state-d">
+        <div class="state-title">🔍 State D: Review time</div>
+        <div class="rule"></div>
+        <div class="action">Run <span class="code">/review</span> (4 parallel agents)</div>
+        <div class="d-layout">
+          <div>
+            <div class="agent-grid">
+              <div class="agent-pill">tauri-reviewer (Claude)</div>
+              <div class="agent-pill">code-quality (Codex MCP)</div>
+              <div class="agent-pill">docs-sync (Claude)</div>
+              <div class="agent-pill">test-coverage (Claude)</div>
+            </div>
+          </div>
+          <div class="branch-stack">
+            <div class="branch rose"><span class="branch-id">D-1</span><span>🚨 Fail &gt; 0 → fix, re-<span class="code">/cycle</span></span></div>
+            <div class="branch violet"><span class="branch-id">D-2</span><span>🎨 Pass + UI change → <span class="code">/ui-check</span> (Playwright/Preview MCP) → re-<span class="code">/cycle</span></span></div>
+            <div class="branch emerald"><span class="branch-id">D-3</span><span>✅ Pass + no UI → auto <span class="code">/journal</span></span></div>
+          </div>
+        </div>
+      </div>
+
+      <div class="card state-e">
+        <div class="state-title">📚 State E: Journal</div>
+        <div class="rule"></div>
+        <div class="action">Run <span class="code">/journal</span> flow</div>
+        <div class="mini-box">CLAUDE.md draft → user approves → move plan to archive</div>
+      </div>
+
+      <div class="card state-f">
+        <div class="state-title">🎉 State F: Cycle done</div>
+        <div class="rule"></div>
+        <div class="action">Suggest commit + <span class="code">release.sh</span> + next <span class="code">/cycle "title"</span></div>
+      </div>
+
+      <div class="card legend">
+        <div class="legend-title">Legend / Key</div>
+        <div class="legend-grid">
+          <div class="legend-item"><span class="legend-symbol">⏸</span><span>Human gate</span></div>
+          <div class="legend-item"><span class="legend-symbol">→</span><span>Auto step</span></div>
+          <div class="legend-item"><span class="legend-symbol" style="color: var(--cyan);">C</span><span>Claude agent</span></div>
+          <div class="legend-item"><span class="legend-symbol" style="color: var(--violet);">M</span><span>Codex MCP</span></div>
+          <div class="legend-item"><span class="legend-symbol" style="color: var(--amber);">P</span><span>Playwright MCP</span></div>
+          <div class="legend-item"><span class="legend-symbol" style="color: var(--emerald);">S</span><span>Superpowers skill</span></div>
+        </div>
+      </div>
+
+      <div class="stop-band">
+        <div class="stop-copy">
+          <div class="stop-title">🔔 Stop hook: <span class="code">.claude/hooks/suggest-next.sh</span></div>
+          <div class="stop-subtitle">Runs after every assistant response</div>
+        </div>
+        <div class="flow">
+          <div class="flow-step"><span class="code">git status / active plans</span></div>
+          <div class="flow-arrow">→</div>
+          <div class="flow-step">stderr hint: next <span class="code">/cycle</span> suggestion</div>
+        </div>
+      </div>
+
+      <svg class="wires" viewBox="0 0 2400 1400" xmlns="http://www.w3.org/2000/svg" aria-hidden="true">
+        <defs>
+          <marker id="arrow" markerWidth="14" markerHeight="14" refX="10" refY="7" orient="auto" markerUnits="strokeWidth">
+            <path d="M 1 1 L 11 7 L 1 13" fill="none" stroke="var(--wire)" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round" />
+          </marker>
+          <marker id="arrow-dashed" markerWidth="14" markerHeight="14" refX="10" refY="7" orient="auto" markerUnits="strokeWidth">
+            <path d="M 1 1 L 11 7 L 1 13" fill="none" stroke="var(--wire)" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round" />
+          </marker>
+        </defs>
+
+        <path d="M 560 274 C 620 274, 660 270, 720 270" fill="none" stroke="var(--wire)" stroke-width="3.5" stroke-linecap="round" marker-end="url(#arrow)" />
+
+        <path d="M 1010 364 C 980 388, 964 404, 950 420" fill="none" stroke="var(--wire)" stroke-width="3.2" stroke-linecap="round" marker-end="url(#arrow)" />
+        <path d="M 1226 364 C 1286 388, 1360 404, 1434 420" fill="none" stroke="var(--wire)" stroke-width="3.2" stroke-linecap="round" marker-end="url(#arrow)" />
+        <path d="M 1454 364 C 1604 386, 1790 404, 1944 420" fill="none" stroke="var(--wire)" stroke-width="3.2" stroke-linecap="round" marker-end="url(#arrow)" />
+        <path d="M 1174 364 C 1148 448, 1122 548, 1096 690" fill="none" stroke="var(--wire)" stroke-width="3.2" stroke-linecap="round" marker-end="url(#arrow)" />
+
+        <path d="M 1510 846 C 1522 838, 1530 838, 1540 838" fill="none" stroke="var(--wire)" stroke-width="3.2" stroke-linecap="round" marker-end="url(#arrow)" />
+        <path d="M 1900 838 C 1912 830, 1922 830, 1940 830" fill="none" stroke="var(--wire)" stroke-width="3.2" stroke-linecap="round" marker-end="url(#arrow)" />
+
+        <path d="M 1385 972 C 1348 1042, 1260 1060, 1186 944" fill="none" stroke="var(--wire)" stroke-width="2.6" stroke-linecap="round" stroke-dasharray="10 10" marker-end="url(#arrow-dashed)" />
+        <path d="M 1385 910 C 1324 994, 1218 1010, 1120 880" fill="none" stroke="var(--wire)" stroke-width="2.6" stroke-linecap="round" stroke-dasharray="10 10" marker-end="url(#arrow-dashed)" />
+        <path d="M 1720 954 C 1720 1034, 1720 1096, 1720 1170" fill="none" stroke="var(--wire)" stroke-width="2.6" stroke-linecap="round" stroke-dasharray="10 10" marker-end="url(#arrow-dashed)" />
+
+        <rect class="label-chip" x="856" y="372" width="146" height="34" rx="17" />
+        <text class="wire-label" x="929" y="394" text-anchor="middle">args + no plan</text>
+
+        <rect class="label-chip" x="1296" y="372" width="202" height="34" rx="17" />
+        <text class="wire-label" x="1397" y="394" text-anchor="middle">no plan + uncommitted</text>
+
+        <rect class="label-chip" x="1772" y="372" width="170" height="34" rx="17" />
+        <text class="wire-label" x="1857" y="394" text-anchor="middle">plan + clean tree</text>
+
+        <rect class="label-chip" x="1038" y="498" width="192" height="34" rx="17" />
+        <text class="wire-label" x="1134" y="520" text-anchor="middle">plan + uncommitted</text>
+
+        <rect class="label-chip" x="1512" y="786" width="238" height="34" rx="17" />
+        <text class="wire-label" x="1631" y="808" text-anchor="middle">post-review pass + plan active</text>
+
+        <rect class="label-chip" x="1910" y="786" width="188" height="34" rx="17" />
+        <text class="wire-label" x="2004" y="808" text-anchor="middle">plan archived + clean</text>
+
+        <rect class="label-chip" x="1296" y="1054" width="168" height="32" rx="16" />
+        <text class="wire-label small code" x="1380" y="1075" text-anchor="middle">re-/cycle</text>
+
+        <circle cx="1720" cy="1170" r="6.5" fill="var(--amber)" />
+      </svg>
+    </div>
+  </body>
+</html>

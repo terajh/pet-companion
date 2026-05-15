@@ -30,3 +30,12 @@ src-tauri/Cargo.lock.bak
 # Runtime
 /tmp/
 *.tmp
+
+# Claude harness — plan artifacts (active + archive)
+.claude/plans/active/*
+.claude/plans/archive/*
+!.claude/plans/active/.gitkeep
+!.claude/plans/archive/.gitkeep
+
+# Claude harness — 개인 로컬 설정 (커밋 금지)
+.claude/settings.local.json
