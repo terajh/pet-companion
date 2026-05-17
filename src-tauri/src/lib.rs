@@ -253,6 +253,11 @@ struct RuntimeModel {
     /// the true→false transition that promotes a session into
     /// `completed_during_runtime`.
     prev_in_progress: HashMap<String, bool>,
+    /// Last notification-target state (`waiting` / `waving`) recorded per
+    /// session.  Used to suppress repeated notifications while a session
+    /// remains in the same attention state, and cleared when the session
+    /// returns to `running`.
+    last_notified_state: HashMap<String, String>,
     last_base_state: Option<PetAnimationState>,
     last_completed_turns: HashMap<String, u64>,
     last_focused_app: Option<SessionApp>,
@@ -283,6 +288,14 @@ struct AppState {
     /// may fail to initialise (e.g. on platforms without FSEvents support);
     /// in that case the 750 ms polling tick still drives `refresh_and_emit`.
     _fs_watcher: StdMutex<Option<RecommendedWatcher>>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct SessionNotification {
+    session_id: String,
+    state: PetAnimationState,
+    subtitle: String,
+    body: String,
 }
 
 #[derive(Debug, Deserialize)]
@@ -1620,8 +1633,10 @@ fn build_tray(app: &mut tauri::App) -> tauri::Result<()> {
 }
 
 async fn refresh_and_emit(app: &AppHandle, state: &AppState) -> Result<(), String> {
-    let payload = {
+    let (payload, pending_notifications) = {
         let mut model = state.model.lock().await;
+        let previously_seen_session_ids: HashSet<String> =
+            model.prev_in_progress.keys().cloned().collect();
         let mut payload = rebuild_payload(&mut model, &state.config_path)?;
         let new_expected_pos = sync_overlay_window(app, &mut model.config, &state.config_path, &payload.overlay);
         if new_expected_pos.is_some() {
@@ -1635,9 +1650,20 @@ async fn refresh_and_emit(app: &AppHandle, state: &AppState) -> Result<(), Strin
             }
             model.onboarding_shown = true;
         }
+        let pending_notifications = collect_notification_transitions(
+            &payload,
+            &previously_seen_session_ids,
+            &mut model.last_notified_state,
+            current_time_millis(),
+        );
         model.current_payload = Some(payload.clone());
-        payload
+        (payload, pending_notifications)
     };
+    if !pending_notifications.is_empty() {
+        tauri::async_runtime::spawn_blocking(move || {
+            dispatch_session_notifications(pending_notifications);
+        });
+    }
     app.emit(APP_EVENT, payload).map_err(|e| e.to_string())
 }
 
@@ -2185,6 +2211,145 @@ fn state_label(state: BaseState) -> &'static str {
         BaseState::Waiting => "Waiting",
         BaseState::Completed => "Completed",
     }
+}
+
+fn session_visual_state_for_notification(
+    session: &SessionSummary,
+    active_session_id: Option<&str>,
+    overlay_effective_state: &PetAnimationState,
+    completed_runtime_session_ids: &HashSet<&str>,
+    now_ms: u64,
+) -> PetAnimationState {
+    if active_session_id == Some(session.session_id.as_str()) {
+        return overlay_effective_state.clone();
+    }
+    if session.in_progress {
+        let age_ms = now_ms.saturating_sub(session.last_activity_at);
+        return if age_ms > WAITING_THRESHOLD_MS {
+            PetAnimationState::Waiting
+        } else {
+            PetAnimationState::Running
+        };
+    }
+    if completed_runtime_session_ids.contains(session.session_id.as_str()) {
+        return PetAnimationState::Waving;
+    }
+    PetAnimationState::Idle
+}
+
+fn notification_state_key(state: &PetAnimationState) -> Option<&'static str> {
+    match state {
+        PetAnimationState::Waiting => Some("waiting"),
+        PetAnimationState::Waving => Some("waving"),
+        _ => None,
+    }
+}
+
+fn notification_body(state: &PetAnimationState) -> Option<&'static str> {
+    match state {
+        PetAnimationState::Waiting => Some("입력이 필요합니다"),
+        PetAnimationState::Waving => Some("작업이 완료됐습니다"),
+        _ => None,
+    }
+}
+
+fn app_display_name(app: SessionApp) -> &'static str {
+    match app {
+        SessionApp::Claude => "Claude",
+        SessionApp::Codex => "Codex",
+    }
+}
+
+fn project_label_from_cwd(cwd: &str) -> Option<String> {
+    let path = Path::new(cwd);
+    path.file_name()
+        .and_then(|name| name.to_str())
+        .filter(|name| !name.is_empty())
+        .map(str::to_string)
+        .or_else(|| {
+            cwd.rsplit('/')
+                .find(|segment| !segment.is_empty())
+                .map(str::to_string)
+        })
+}
+
+fn notification_subtitle(session: &SessionSummary) -> String {
+    let project = project_label_from_cwd(&session.cwd)
+        .filter(|value| !value.is_empty())
+        .unwrap_or_else(|| session.title.clone());
+    format!("{project} · {}", app_display_name(session.app_kind))
+}
+
+fn collect_notification_transitions(
+    payload: &AppPayload,
+    previously_seen_session_ids: &HashSet<String>,
+    last_notified_state: &mut HashMap<String, String>,
+    now_ms: u64,
+) -> Vec<SessionNotification> {
+    let live_ids: HashSet<&str> = payload
+        .overlay
+        .sessions
+        .iter()
+        .map(|session| session.session_id.as_str())
+        .collect();
+    last_notified_state.retain(|session_id, _| live_ids.contains(session_id.as_str()));
+
+    let active_session_id = payload
+        .overlay
+        .active_session
+        .as_ref()
+        .map(|session| session.session_id.as_str());
+    let completed_runtime_session_ids: HashSet<&str> = payload
+        .overlay
+        .completed_runtime_session_ids
+        .iter()
+        .map(String::as_str)
+        .collect();
+
+    let mut notifications = Vec::new();
+    for session in &payload.overlay.sessions {
+        let state = session_visual_state_for_notification(
+            session,
+            active_session_id,
+            &payload.overlay.effective_state,
+            &completed_runtime_session_ids,
+            now_ms,
+        );
+
+        if matches!(state, PetAnimationState::Running) {
+            last_notified_state.remove(&session.session_id);
+            continue;
+        }
+
+        let Some(state_key) = notification_state_key(&state) else {
+            continue;
+        };
+
+        if !previously_seen_session_ids.contains(&session.session_id) {
+            last_notified_state.insert(session.session_id.clone(), state_key.to_string());
+            continue;
+        }
+
+        if last_notified_state
+            .get(&session.session_id)
+            .map(String::as_str)
+            == Some(state_key)
+        {
+            continue;
+        }
+
+        last_notified_state.insert(session.session_id.clone(), state_key.to_string());
+        if let Some(body) = notification_body(&state) {
+            notifications.push(SessionNotification {
+                session_id: session.session_id.clone(),
+                state,
+                subtitle: notification_subtitle(session),
+                body: body.to_string(),
+            });
+        }
+    }
+
+    notifications
 }
 
 fn should_show_card(state: &PetAnimationState, claude_frontmost: bool) -> bool {
@@ -3180,6 +3345,123 @@ fn escape_applescript(value: &str) -> String {
     value.replace('\\', "\\\\").replace('"', "\\\"")
 }
 
+fn frontmost_app_name_via_jxa() -> Result<String, String> {
+    let script = r#"
+try {
+  const name = Application("System Events").frontmostApplication().name();
+  console.log(String(name || ""));
+} catch (err) {
+  console.log(`ERROR:${String(err)}`);
+}
+"#;
+
+    let output = Command::new("osascript")
+        .arg("-l")
+        .arg("JavaScript")
+        .arg("-e")
+        .arg(script)
+        .output()
+        .map_err(|e| e.to_string())?;
+
+    if !output.status.success() {
+        return Err(String::from_utf8_lossy(&output.stderr).trim().to_string());
+    }
+
+    let stdout = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    if let Some(err) = stdout.strip_prefix("ERROR:") {
+        return Err(err.trim().to_string());
+    }
+
+    Ok(stdout)
+}
+
+#[cfg(target_os = "macos")]
+fn frontmost_app_name_via_nsworkspace() -> Option<String> {
+    use std::ffi::CStr;
+    use std::os::raw::c_char;
+
+    use objc::runtime::Object;
+    use objc::{class, msg_send, sel, sel_impl};
+
+    unsafe {
+        let workspace: *mut Object = msg_send![class!(NSWorkspace), sharedWorkspace];
+        if workspace.is_null() {
+            return None;
+        }
+        let frontmost_app: *mut Object = msg_send![workspace, frontmostApplication];
+        if frontmost_app.is_null() {
+            return None;
+        }
+        let localized_name: *mut Object = msg_send![frontmost_app, localizedName];
+        if localized_name.is_null() {
+            return None;
+        }
+        let utf8: *const c_char = msg_send![localized_name, UTF8String];
+        if utf8.is_null() {
+            return None;
+        }
+        Some(CStr::from_ptr(utf8).to_string_lossy().into_owned())
+    }
+}
+
+#[cfg(not(target_os = "macos"))]
+fn frontmost_app_name_via_nsworkspace() -> Option<String> {
+    None
+}
+
+fn is_pet_companion_frontmost() -> Result<bool, String> {
+    match frontmost_app_name_via_jxa() {
+        Ok(name) => Ok(name == "Pet Companion"),
+        Err(jxa_err) => {
+            if let Some(name) = frontmost_app_name_via_nsworkspace() {
+                eprintln!("[notify] JXA frontmost check failed, used NSWorkspace fallback: {jxa_err}");
+                return Ok(name == "Pet Companion");
+            }
+            Err(jxa_err)
+        }
+    }
+}
+
+fn send_session_notification(notification: &SessionNotification) {
+    let title = escape_applescript("Pet Companion");
+    let subtitle = escape_applescript(&notification.subtitle);
+    let body = escape_applescript(&notification.body);
+    let script = format!(
+        r#"display notification "{body}" with title "{title}" subtitle "{subtitle}""#
+    );
+    match Command::new("osascript").arg("-e").arg(&script).output() {
+        Ok(output) if output.status.success() => {}
+        Ok(output) => {
+            eprintln!(
+                "[notify] notification failed session_id={} state={:?}: {}",
+                notification.session_id,
+                notification.state,
+                String::from_utf8_lossy(&output.stderr).trim()
+            );
+        }
+        Err(err) => {
+            eprintln!(
+                "[notify] notification command failed session_id={} state={:?}: {}",
+                notification.session_id, notification.state, err
+            );
+        }
+    }
+}
+
+fn dispatch_session_notifications(notifications: Vec<SessionNotification>) {
+    match is_pet_companion_frontmost() {
+        Ok(true) => {}
+        Ok(false) => {
+            for notification in &notifications {
+                send_session_notification(notification);
+            }
+        }
+        Err(err) => {
+            eprintln!("[notify] frontmost check failed: {err}");
+        }
+    }
+}
+
 fn open_url(url: &str) -> Result<(), String> {
     Command::new("open")
         .arg(url)
@@ -3451,6 +3733,54 @@ mod tests {
             claude_running: true,
             codex_running: true,
             ..Default::default()
+        }
+    }
+
+    fn notification_payload(
+        active_session: Option<SessionSummary>,
+        sessions: Vec<SessionSummary>,
+        effective_state: PetAnimationState,
+        completed_runtime_session_ids: &[&str],
+    ) -> AppPayload {
+        AppPayload {
+            codex_selected_pet_id: None,
+            config: FrontendConfig {
+                attached: true,
+                language: "ko".to_string(),
+                manual_session_app: None,
+                manual_session_id: None,
+                pet_override_id: None,
+                pet_scale: 1.0,
+                tracked_app: "auto".to_string(),
+            },
+            overlay: OverlaySnapshot {
+                active_session,
+                claude_frontmost: false,
+                codex_frontmost: false,
+                current_window_title: None,
+                effective_state,
+                message_preview: None,
+                manual_session_missing: false,
+                manual_session_pinned: false,
+                permission_granted: true,
+                pet: PetDescriptor {
+                    description: String::new(),
+                    display_name: "Bori".to_string(),
+                    id: "bori".to_string(),
+                    source: "custom".to_string(),
+                    sprite_sheet_path: String::new(),
+                },
+                sessions,
+                show_card: true,
+                state_label: "Idle".to_string(),
+                dismissed_session_ids: vec![],
+                completed_runtime_session_ids: completed_runtime_session_ids
+                    .iter()
+                    .map(|id| (*id).to_string())
+                    .collect(),
+                cards_below: false,
+            },
+            pets: vec![],
         }
     }
 
@@ -3747,5 +4077,172 @@ mod tests {
 
         assert!(completed.contains("s1"));
     }
-}
 
+    // ---------- notifications ----------
+
+    #[test]
+    fn collect_notification_transitions_waiting_notifies_once() {
+        let tracked = SessionSummary {
+            app_kind: SessionApp::Claude,
+            cli_session_id: None,
+            completed_preview: None,
+            completed_turns: None,
+            cwd: "/tmp/my-project".to_string(),
+            in_progress: true,
+            is_archived: false,
+            last_activity_at: now_ms().saturating_sub(31_000),
+            session_id: "s1".to_string(),
+            title: "Need input".to_string(),
+            user_preview: None,
+            assistant_preview: None,
+        };
+        let payload = notification_payload(
+            Some(tracked.clone()),
+            vec![tracked],
+            PetAnimationState::Waiting,
+            &[],
+        );
+        let mut last_notified = HashMap::new();
+        let previously_seen: HashSet<String> = vec!["s1".to_string()].into_iter().collect();
+
+        let first = collect_notification_transitions(
+            &payload,
+            &previously_seen,
+            &mut last_notified,
+            now_ms(),
+        );
+        assert_eq!(first.len(), 1, "waiting transition should notify once");
+        assert_eq!(first[0].session_id, "s1");
+        assert_eq!(first[0].state, PetAnimationState::Waiting);
+        assert_eq!(first[0].subtitle, "my-project · Claude");
+        assert_eq!(first[0].body, "입력이 필요합니다");
+        assert_eq!(last_notified.get("s1").map(String::as_str), Some("waiting"));
+
+        let second = collect_notification_transitions(
+            &payload,
+            &previously_seen,
+            &mut last_notified,
+            now_ms(),
+        );
+        assert!(
+            second.is_empty(),
+            "same waiting state on later ticks must not re-notify"
+        );
+    }
+
+    #[test]
+    fn collect_notification_transitions_first_observation_seeds_without_notification() {
+        let tracked = SessionSummary {
+            app_kind: SessionApp::Codex,
+            cli_session_id: None,
+            completed_preview: None,
+            completed_turns: None,
+            cwd: "/tmp/workspace-alpha".to_string(),
+            in_progress: true,
+            is_archived: false,
+            last_activity_at: now_ms().saturating_sub(31_000),
+            session_id: "s1".to_string(),
+            title: "Need input".to_string(),
+            user_preview: None,
+            assistant_preview: None,
+        };
+        let payload = notification_payload(
+            Some(tracked.clone()),
+            vec![tracked],
+            PetAnimationState::Waiting,
+            &[],
+        );
+        let mut last_notified = HashMap::new();
+        let previously_seen: HashSet<String> = HashSet::new();
+
+        let notifications = collect_notification_transitions(
+            &payload,
+            &previously_seen,
+            &mut last_notified,
+            now_ms(),
+        );
+
+        assert!(
+            notifications.is_empty(),
+            "first observation should seed state without startup spam"
+        );
+        assert_eq!(last_notified.get("s1").map(String::as_str), Some("waiting"));
+    }
+
+    #[test]
+    fn collect_notification_transitions_running_clears_and_reenables_waving() {
+        let completed = SessionSummary {
+            app_kind: SessionApp::Claude,
+            cli_session_id: None,
+            completed_preview: Some("Done".to_string()),
+            completed_turns: Some(1),
+            cwd: "/tmp/my-project".to_string(),
+            in_progress: false,
+            is_archived: false,
+            last_activity_at: now_ms(),
+            session_id: "s1".to_string(),
+            title: "Done".to_string(),
+            user_preview: None,
+            assistant_preview: Some("Done".to_string()),
+        };
+        let completed_payload = notification_payload(
+            Some(completed.clone()),
+            vec![completed.clone()],
+            PetAnimationState::Waving,
+            &["s1"],
+        );
+        let mut last_notified = HashMap::new();
+        let previously_seen: HashSet<String> = vec!["s1".to_string()].into_iter().collect();
+
+        let first = collect_notification_transitions(
+            &completed_payload,
+            &previously_seen,
+            &mut last_notified,
+            now_ms(),
+        );
+        assert_eq!(first.len(), 1, "waving transition should notify");
+        assert_eq!(first[0].state, PetAnimationState::Waving);
+        assert_eq!(first[0].body, "작업이 완료됐습니다");
+        assert_eq!(last_notified.get("s1").map(String::as_str), Some("waving"));
+
+        let running = SessionSummary {
+            in_progress: true,
+            last_activity_at: now_ms(),
+            completed_preview: None,
+            completed_turns: Some(1),
+            user_preview: Some("New task".to_string()),
+            assistant_preview: None,
+            ..completed.clone()
+        };
+        let running_payload = notification_payload(
+            Some(running.clone()),
+            vec![running],
+            PetAnimationState::Running,
+            &[],
+        );
+
+        let during_running = collect_notification_transitions(
+            &running_payload,
+            &previously_seen,
+            &mut last_notified,
+            now_ms(),
+        );
+        assert!(during_running.is_empty(), "running state itself must not notify");
+        assert!(
+            !last_notified.contains_key("s1"),
+            "running should clear prior notified state so the next completion can notify again"
+        );
+
+        let second = collect_notification_transitions(
+            &completed_payload,
+            &previously_seen,
+            &mut last_notified,
+            now_ms(),
+        );
+        assert_eq!(
+            second.len(),
+            1,
+            "after running clears the marker, the next waving transition must notify again"
+        );
+    }
+}
