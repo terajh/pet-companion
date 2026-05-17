@@ -331,7 +331,7 @@ dependencies = [
 
 [[package]]
 name = "claude-pet-companion"
-version = "0.1.36"
+version = "0.1.37"
 dependencies = [
  "base64 0.22.1",
  "notify",

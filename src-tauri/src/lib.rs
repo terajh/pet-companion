@@ -642,6 +642,14 @@ struct BeginDragInput {
     /// duration of the drag so the pet stays anchored under the cursor.
     grab_offset_x: f64,
     grab_offset_y: f64,
+    /// Initial cursor direction known to the frontend at the moment the drag
+    /// crossed `DRAG_THRESHOLD`.  `true` = cursor moved left of pointerdown
+    /// origin (negative dx in screen coords).  Used to seed the initial
+    /// `companion:facing` emit and the loop's `last_facing_left` so the pet
+    /// renders the correct horizontal flip immediately — avoiding the ~35 ms
+    /// "weird motion" flash where the pet briefly ran right while the user
+    /// dragged left (v0.1.37 user report).
+    initial_facing_left: bool,
 }
 
 /// Starts a Rust-driven cursor-polling drag loop.  Frontend calls this exactly
@@ -710,14 +718,19 @@ async fn cmd_begin_drag(
         .map(|m| m.scale_factor())
         .unwrap_or(1.0);
 
-    // Emit initial facing state (dragging=true, facing right by default).
-    // The loop will flip `facing_left` later if the cursor moves left far
-    // enough to cross the hysteresis threshold.
+    // Emit initial facing state immediately.  Frontend has already moved the
+    // cursor past DRAG_THRESHOLD (≥ 6 logical px) by the time it calls this,
+    // so it KNOWS the initial direction — passing it as `initial_facing_left`
+    // lets us emit the correct flip on the very first frame.  Hard-coding
+    // `facing_left: false` here (the pre-v0.1.37 behaviour) caused a ~35 ms
+    // window where the pet ran right while the user dragged left before the
+    // loop's first tick caught up and emitted the correct direction.
+    let initial_facing_left = input.initial_facing_left;
     let _ = app.emit(
         FACING_EVENT,
         FacingPayload {
             dragging: true,
-            facing_left: false,
+            facing_left: initial_facing_left,
         },
     );
 
@@ -732,6 +745,7 @@ async fn cmd_begin_drag(
             grab_y,
             pet_scale,
             primary_scale,
+            initial_facing_left,
             cancel_for_loop,
         )
         .await;
@@ -779,6 +793,7 @@ async fn run_drag_cursor_loop(
     grab_offset_y: f64,
     pet_scale: f32,
     primary_scale: f64,
+    initial_facing_left: bool,
     cancel: Arc<AtomicBool>,
 ) {
     let mut interval = tokio::time::interval(Duration::from_millis(16));
@@ -791,9 +806,11 @@ async fn run_drag_cursor_loop(
     // actually flips (with a 4-logical-px hysteresis on the running anchor) so
     // we never spam the event bus at 60Hz. `last_cursor_x` is the X coord we
     // compared against last; `last_facing_left` is the most-recently-emitted
-    // facing. We seed `last_facing_left = false` (right-facing default).
+    // facing. We seed `last_facing_left = initial_facing_left` so the loop's
+    // diff matches whatever `cmd_begin_drag` already emitted — otherwise the
+    // first tick that crosses hysteresis would re-emit the same value.
     let mut last_cursor_x: Option<f64> = None;
-    let mut last_facing_left: bool = false;
+    let mut last_facing_left: bool = initial_facing_left;
     const FACING_HYSTERESIS_PX: f64 = 4.0;
     loop {
         interval.tick().await;

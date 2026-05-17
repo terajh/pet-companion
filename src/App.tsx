@@ -911,10 +911,18 @@ function OverlayApp() {
       // origin flip that caused the v0.1.25 oscillation.  Also flips
       // `detached = true` synchronously so the 750 ms sync tick stops
       // re-anchoring to the tracked Claude/Codex window.
+      //
+      // v0.1.37: pass `initialFacingLeft` so Rust emits the correct facing on
+      // the very first event.  We already know the direction here — the user
+      // just dragged at least `DRAG_THRESHOLD` (6 px) in some direction, and
+      // `dx` was computed above.  Without this, the initial Rust emit was
+      // hard-coded to right-facing and the loop took ~35 ms to flip, causing a
+      // visible "running right while moving left" flash on every left drag.
       call("cmd_begin_drag", {
         input: {
           grabOffsetX: state.grabOffsetX,
           grabOffsetY: state.grabOffsetY,
+          initialFacingLeft: dx < 0,
         },
       }).catch((err) => console.error("cmd_begin_drag failed:", err));
     }
