@@ -76,6 +76,7 @@ function makePayload(
       petScale: 1,
       watchClaude: true,
       watchCodex: true,
+      petHidden: false,
       ...configOverrides,
     },
     overlay,

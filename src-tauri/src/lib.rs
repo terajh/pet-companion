@@ -1,4 +1,5 @@
 use base64::Engine;
+use notify::{Event as NotifyEvent, EventKind, RecommendedWatcher, RecursiveMode, Watcher};
 use std::collections::{HashMap, HashSet};
 use std::env;
 use std::fs;
@@ -18,7 +19,7 @@ use tauri::{
 };
 use tauri_plugin_autostart::MacosLauncher;
 use time::format_description::well_known::Rfc3339;
-use tokio::sync::Mutex;
+use tokio::sync::{mpsc, Mutex};
 
 const APP_EVENT: &str = "companion:update";
 /// Lightweight pet-scale-only event emitted by `cmd_set_pet_scale` before the
@@ -151,6 +152,7 @@ struct FrontendConfig {
     tracked_app: String,
     watch_claude: bool,
     watch_codex: bool,
+    pet_hidden: bool,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -184,6 +186,11 @@ struct PersistedConfig {
     watch_claude: bool,
     #[serde(default = "default_watch_app")]
     watch_codex: bool,
+    // Persists the user's "hide pet" choice across app restarts.  When
+    // true the overlay window is hidden on launch; toggled via the pet
+    // right-click menu, tray menu, or tray icon click.
+    #[serde(default)]
+    pet_hidden: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
@@ -270,6 +277,12 @@ struct AppState {
     /// loop the instant it starts (root cause of the v0.1.26 "doesn't move at all"
     /// bug).
     drag_cancel: StdMutex<Option<Arc<AtomicBool>>>,
+    /// Holds the live `notify` filesystem watcher.  Created in `setup()` and
+    /// kept alive for the lifetime of the app — dropping the watcher stops
+    /// FSEvents notifications.  Stored in an `Option` because the watcher
+    /// may fail to initialise (e.g. on platforms without FSEvents support);
+    /// in that case the 750 ms polling tick still drives `refresh_and_emit`.
+    _fs_watcher: StdMutex<Option<RecommendedWatcher>>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -301,6 +314,12 @@ struct PetScaleInput {
 struct WatchAppsInput {
     watch_claude: bool,
     watch_codex: bool,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct PetHiddenInput {
+    hidden: bool,
 }
 
 /// Payload for `FACING_EVENT`. `dragging=false` means the pet is no longer
@@ -348,6 +367,7 @@ impl Default for PersistedConfig {
             tracked_app: default_tracked_app(),
             watch_claude: default_watch_app(),
             watch_codex: default_watch_app(),
+            pet_hidden: false,
         }
     }
 }
@@ -516,6 +536,55 @@ async fn cmd_set_watch_apps(
             eprintln!("[watch_apps] refresh_and_emit failed: {}", err);
         }
     });
+    Ok(())
+}
+
+/// Absolute setter for the overlay hide state.  Used by every entry point
+/// that toggles pet visibility (IPC from the right-click menu, tray menu
+/// item, tray icon click).  Two invariants:
+///
+///   • Visual flip runs **before** the model lock is acquired so the user
+///     sees the window change immediately.  The 750 ms refresh tick can
+///     hold the lock for hundreds of ms; deferring the hide/show until the
+///     spawn finishes would feel laggy (v0.1.32 sidechannel rule).
+///   • Persistence runs on a background spawn so the entry-point function
+///     (IPC handler / menu closure / tray closure) returns immediately and
+///     never blocks on `model.lock().await` (v0.1.27 model-lock rule).
+///
+/// Both tray entry points compute `hidden` from the **current window
+/// visibility** synchronously, so even if two toggles are queued back to
+/// back, each one targets an absolute state instead of toggling whatever
+/// the other spawn happened to write.  This eliminates the race where two
+/// "toggle" callbacks could resolve in either order and leave the window
+/// in a state opposite to the user's last click.
+fn apply_pet_hidden(app: &AppHandle, hidden: bool) {
+    if let Some(window) = app.get_webview_window(OVERLAY_WINDOW_LABEL) {
+        let _ = if hidden { window.hide() } else { window.show() };
+    }
+    let app_clone = app.clone();
+    tauri::async_runtime::spawn(async move {
+        let state = app_clone.state::<AppState>();
+        {
+            let mut model = state.model.lock().await;
+            model.config.pet_hidden = hidden;
+            if let Err(err) = persist_config(&state.config_path, &model.config) {
+                eprintln!("[pet_hidden] persist_config failed: {}", err);
+                return;
+            }
+        }
+        if let Err(err) = refresh_and_emit(&app_clone, &state).await {
+            eprintln!("[pet_hidden] refresh_and_emit failed: {}", err);
+        }
+    });
+}
+
+#[tauri::command]
+async fn cmd_set_pet_hidden(
+    app: AppHandle,
+    _state: State<'_, AppState>,
+    input: PetHiddenInput,
+) -> Result<(), String> {
+    apply_pet_hidden(&app, input.hidden);
     Ok(())
 }
 
@@ -1288,6 +1357,7 @@ pub fn run() {
             config_path,
             model: Arc::new(Mutex::new(runtime)),
             drag_cancel: StdMutex::new(None),
+            _fs_watcher: StdMutex::new(None),
         })
         .on_window_event(|window, event| match event {
             WindowEvent::CloseRequested { api, .. } => {
@@ -1311,8 +1381,16 @@ pub fn run() {
             build_tray(app)?;
             position_overlay_at_startup(app);
 
+            // Restore the user's persisted hide state.  If they explicitly
+            // hid the pet via the right-click menu or tray, keep it hidden
+            // across restarts (CompanionConfig.pet_hidden).
+            let pet_hidden = {
+                let state = app.state::<AppState>();
+                let model = state.model.blocking_lock();
+                model.config.pet_hidden
+            };
             if let Some(window) = app.get_webview_window(OVERLAY_WINDOW_LABEL) {
-                let _ = window.show();
+                let _ = if pet_hidden { window.hide() } else { window.show() };
             }
 
             // Lift overlay window level above the menu bar plane.  One-shot,
@@ -1320,14 +1398,86 @@ pub fn run() {
             configure_overlay_window_level(&app.handle().clone());
 
             let app_handle = app.handle().clone();
+
+            // FSEvents-based instant session sync.  The recommended notify
+            // watcher pushes a unit signal into `fs_tx` whenever a Create /
+            // Modify / Remove event fires under the watched session dirs.
+            // The refresh loop below races the 750 ms polling tick against
+            // this channel; an event triggers a 50 ms debounce + refresh so
+            // session state changes appear almost instantly instead of
+            // waiting up to 750 ms for the next tick.  If watcher creation
+            // or any individual watch call fails, we log and fall through
+            // to the polling baseline.
+            let (fs_tx, mut fs_rx) = mpsc::unbounded_channel::<()>();
+            match notify::recommended_watcher({
+                let tx = fs_tx.clone();
+                move |res: notify::Result<NotifyEvent>| match res {
+                    Ok(event) => {
+                        if matches!(
+                            event.kind,
+                            EventKind::Create(_) | EventKind::Modify(_) | EventKind::Remove(_)
+                        ) {
+                            let _ = tx.send(());
+                        }
+                    }
+                    Err(err) => {
+                        eprintln!("[fs_watcher] event error: {}", err);
+                    }
+                }
+            }) {
+                Ok(mut watcher) => {
+                    if let Ok(home) = home_dir() {
+                        let watches: [(PathBuf, RecursiveMode); 3] = [
+                            (home.join(".claude").join("projects"), RecursiveMode::Recursive),
+                            (home.join(".codex").join("sessions"), RecursiveMode::Recursive),
+                            (home.join(".codex"), RecursiveMode::NonRecursive),
+                        ];
+                        for (path, mode) in &watches {
+                            if !path.exists() {
+                                continue;
+                            }
+                            if let Err(err) = watcher.watch(path, *mode) {
+                                eprintln!(
+                                    "[fs_watcher] failed to watch {}: {}",
+                                    path.display(),
+                                    err
+                                );
+                            }
+                        }
+                    }
+                    let state = app.state::<AppState>();
+                    if let Ok(mut slot) = state._fs_watcher.lock() {
+                        *slot = Some(watcher);
+                    };
+                }
+                Err(err) => {
+                    eprintln!("[fs_watcher] notify::recommended_watcher failed: {}", err);
+                }
+            }
+            drop(fs_tx);
+
             tauri::async_runtime::spawn(async move {
                 let state = app_handle.state::<AppState>();
                 let _ = refresh_and_emit(&app_handle, &state).await;
 
                 let mut interval = tokio::time::interval(Duration::from_millis(750));
+                interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
                 loop {
-                    interval.tick().await;
-                    let _ = refresh_and_emit(&app_handle, &state).await;
+                    tokio::select! {
+                        _ = interval.tick() => {
+                            let _ = refresh_and_emit(&app_handle, &state).await;
+                        }
+                        Some(()) = fs_rx.recv() => {
+                            // 50 ms debounce: FSEvents on macOS already
+                            // coalesces with ~10 ms latency, but jsonl
+                            // writers often flush multiple lines per
+                            // turn — we drain any pending signals before
+                            // refreshing to avoid back-to-back rebuilds.
+                            tokio::time::sleep(Duration::from_millis(50)).await;
+                            while fs_rx.try_recv().is_ok() {}
+                            let _ = refresh_and_emit(&app_handle, &state).await;
+                        }
+                    }
                 }
             });
 
@@ -1350,6 +1500,7 @@ pub fn run() {
             cmd_set_pet_override,
             cmd_set_pet_scale,
             cmd_set_watch_apps,
+            cmd_set_pet_hidden,
             cmd_set_tracked_app,
             cmd_show_settings,
             cmd_cursor_position_in_overlay,
@@ -1400,10 +1551,20 @@ fn build_tray(app: &mut tauri::App) -> tauri::Result<()> {
         .show_menu_on_left_click(false)
         .on_menu_event(|app, event| match event.id().as_ref() {
             "show_pet" => {
-                if let Some(window) = app.get_webview_window(OVERLAY_WINDOW_LABEL) {
-                    let visible = window.is_visible().unwrap_or(false);
-                    let _ = if visible { window.hide() } else { window.show() };
-                }
+                // Compute the next state synchronously from the current
+                // window visibility (the source of truth on macOS) and
+                // route through `apply_pet_hidden`.  Using an absolute
+                // setter — rather than `!model.config.pet_hidden` — keeps
+                // concurrent toggles consistent: if cmd_set_pet_hidden's
+                // spawn is queued behind a refresh tick and the user
+                // clicks the tray menu right after, both targets resolve
+                // to a definite hidden value instead of racing on
+                // whichever spawn writes first.
+                let currently_visible = app
+                    .get_webview_window(OVERLAY_WINDOW_LABEL)
+                    .and_then(|w| w.is_visible().ok())
+                    .unwrap_or(false);
+                apply_pet_hidden(app, currently_visible);
             }
             "attach_pet" => {
                 let handle = app.clone();
@@ -1428,10 +1589,12 @@ fn build_tray(app: &mut tauri::App) -> tauri::Result<()> {
         })
         .on_tray_icon_event(|tray, event| {
             if let TrayIconEvent::Click { .. } = event {
-                if let Some(window) = tray.app_handle().get_webview_window(OVERLAY_WINDOW_LABEL) {
-                    let visible = window.is_visible().unwrap_or(false);
-                    let _ = if visible { window.hide() } else { window.show() };
-                }
+                let app = tray.app_handle();
+                let currently_visible = app
+                    .get_webview_window(OVERLAY_WINDOW_LABEL)
+                    .and_then(|w| w.is_visible().ok())
+                    .unwrap_or(false);
+                apply_pet_hidden(app, currently_visible);
             }
         })
         .build(app)?;
@@ -1674,6 +1837,7 @@ fn rebuild_payload(model: &mut RuntimeModel, config_path: &Path) -> Result<AppPa
             tracked_app: normalize_tracked_app(&model.config.tracked_app).to_string(),
             watch_claude: model.config.watch_claude,
             watch_codex: model.config.watch_codex,
+            pet_hidden: model.config.pet_hidden,
         },
         overlay: OverlaySnapshot {
             active_session,

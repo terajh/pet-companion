@@ -40,6 +40,7 @@ export interface CompanionConfig {
   petScale: number;
   watchClaude: boolean;
   watchCodex: boolean;
+  petHidden: boolean;
 }
 
 export interface OverlaySnapshot {

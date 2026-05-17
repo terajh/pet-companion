@@ -28,6 +28,7 @@ const INITIAL_PAYLOAD: AppPayload = {
     petScale: 1.0,
     watchClaude: true,
     watchCodex: true,
+    petHidden: false,
   },
   codexSelectedPetId: null,
   overlay: {
@@ -97,6 +98,7 @@ const MESSAGES = {
     detached: "Detached overlay",
     effectivePet: "Effective pet",
     focusApp: "Focus app",
+    hidePet: "Hide Pet",
     language: "Language",
     manualPetOverride: "Manual pet override",
     noActiveSession: "No active session",
@@ -137,6 +139,7 @@ const MESSAGES = {
     detached: "분리 오버레이",
     effectivePet: "실제 사용 펫",
     focusApp: "앱 포커스",
+    hidePet: "펫 숨기기",
     language: "언어",
     manualPetOverride: "수동 펫 선택",
     noActiveSession: "활성 세션 없음",
@@ -675,10 +678,13 @@ function OverlayCardStack({
 function ContextMenu({
   menu,
   onClose,
+  onHidePet,
   onOpenSettings,
+  strings,
 }: {
   menu: ContextMenuState;
   onClose: () => void;
+  onHidePet: () => void;
   onOpenSettings: () => void;
   strings: Messages;
 }) {
@@ -690,8 +696,11 @@ function ContextMenu({
     <>
       <div className="menu-backdrop" onClick={onClose} />
       <div className="context-menu" style={{ left: menu.x, top: menu.y }}>
+        <button className="context-menu__item" onClick={onHidePet} type="button">
+          {strings.hidePet}
+        </button>
         <button className="context-menu__item" onClick={onOpenSettings} type="button">
-          설정 열기
+          {strings.openSettings}
         </button>
       </div>
     </>
@@ -997,6 +1006,10 @@ function OverlayApp() {
       <ContextMenu
         menu={menu}
         onClose={() => setMenu(null)}
+        onHidePet={() => {
+          setMenu(null);
+          call("cmd_set_pet_hidden", { input: { hidden: true } }).catch(console.error);
+        }}
         onOpenSettings={() => {
           setMenu(null);
           call("cmd_show_settings").catch(console.error);
