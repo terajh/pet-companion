@@ -26,6 +26,15 @@ const APP_EVENT: &str = "companion:update";
 /// model lock is touched.  Frontend updates its local payload optimistically
 /// so the slider feels instantaneous regardless of refresh-tick contention.
 const PET_SCALE_EVENT: &str = "companion:pet_scale";
+/// Lightweight watch-apps event emitted by `cmd_set_watch_apps` before the
+/// model lock is touched.  Frontend updates `payload.config.watchClaude/
+/// watchCodex` optimistically so unchecked apps' cards disappear instantly
+/// regardless of refresh-tick contention.
+const WATCH_APPS_EVENT: &str = "companion:watch_apps";
+/// Lightweight dismiss event emitted by `cmd_focus_session_by_id` before any
+/// lock attempt so completed cards disappear immediately on click even if the
+/// 750ms refresh tick currently owns the model mutex.
+const DISMISS_EVENT: &str = "companion:dismiss";
 /// Same pattern for pet override.  Payload is just the new override id (or
 /// null for auto-follow).  Frontend resolves the descriptor from its local
 /// `payload.pets` list so the overlay sprite swaps before the spawn's
@@ -200,7 +209,6 @@ struct SavedPosition {
     y: i32,
 }
 
-
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct PetManifest {
@@ -228,6 +236,13 @@ struct FrontWindowState {
     frontmost_app: Option<SessionApp>,
     claude_running: bool,
     codex_running: bool,
+    /// `true` when process detection actually completed (JXA or AppleScript
+    /// fallback returned a usable result).  `false` when both probes failed
+    /// (e.g. Automation TCC permission denied for `System Events`).  Used by
+    /// `clear_stale_in_progress` to decide whether the "app not running"
+    /// branch is trustworthy — detection failure must NOT force every session
+    /// to idle.
+    detection_ok: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -253,11 +268,6 @@ struct RuntimeModel {
     /// the true→false transition that promotes a session into
     /// `completed_during_runtime`.
     prev_in_progress: HashMap<String, bool>,
-    /// Last notification-target state (`waiting` / `waving`) recorded per
-    /// session.  Used to suppress repeated notifications while a session
-    /// remains in the same attention state, and cleared when the session
-    /// returns to `running`.
-    last_notified_state: HashMap<String, String>,
     last_base_state: Option<PetAnimationState>,
     last_completed_turns: HashMap<String, u64>,
     last_focused_app: Option<SessionApp>,
@@ -288,14 +298,6 @@ struct AppState {
     /// may fail to initialise (e.g. on platforms without FSEvents support);
     /// in that case the 750 ms polling tick still drives `refresh_and_emit`.
     _fs_watcher: StdMutex<Option<RecommendedWatcher>>,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-struct SessionNotification {
-    session_id: String,
-    state: PetAnimationState,
-    subtitle: String,
-    body: String,
 }
 
 #[derive(Debug, Deserialize)]
@@ -329,6 +331,19 @@ struct WatchAppsInput {
     watch_codex: bool,
 }
 
+#[derive(Serialize, Clone)]
+#[serde(rename_all = "camelCase")]
+struct WatchAppsEvent {
+    watch_claude: bool,
+    watch_codex: bool,
+}
+
+#[derive(Serialize, Clone)]
+#[serde(rename_all = "camelCase")]
+struct DismissEvent {
+    session_id: String,
+}
+
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct PetHiddenInput {
@@ -344,7 +359,6 @@ struct FacingPayload {
     dragging: bool,
     facing_left: bool,
 }
-
 
 #[derive(Debug, Clone)]
 struct PetResolution {
@@ -525,6 +539,16 @@ async fn cmd_set_watch_apps(
     _state: State<'_, AppState>,
     input: WatchAppsInput,
 ) -> Result<(), String> {
+    let watch_claude = input.watch_claude;
+    let watch_codex = input.watch_codex;
+    let _ = app.emit(
+        WATCH_APPS_EVENT,
+        WatchAppsEvent {
+            watch_claude,
+            watch_codex,
+        },
+    );
+
     // Same v0.1.27 model-lock invariant as cmd_set_pet_scale: avoid awaiting
     // `state.model.lock()` on the IPC hot path because the 750ms refresh tick
     // may be holding it through a full session scan.  Spawn the lock + persist
@@ -532,8 +556,6 @@ async fn cmd_set_watch_apps(
     // immediately and the checkbox feels responsive.  The local-mirror state
     // in `SettingsApp` keeps the UI in sync until the backend echo arrives.
     let app_clone = app.clone();
-    let watch_claude = input.watch_claude;
-    let watch_codex = input.watch_codex;
     tauri::async_runtime::spawn(async move {
         let state = app_clone.state::<AppState>();
         {
@@ -950,6 +972,14 @@ async fn cmd_focus_session_by_id(
         app_kind,
         dismiss,
     } = input;
+    if dismiss {
+        let _ = app.emit(
+            DISMISS_EVENT,
+            DismissEvent {
+                session_id: session_id.clone(),
+            },
+        );
+    }
     let session_id_for_focus = session_id.clone();
     let app_kind_for_focus = app_kind;
     tauri::async_runtime::spawn_blocking(move || match app_kind_for_focus {
@@ -1115,13 +1145,22 @@ unsafe fn set_window_origin_unconstrained(
 
     #[repr(C)]
     #[derive(Copy, Clone)]
-    struct NSPoint { x: f64, y: f64 }
+    struct NSPoint {
+        x: f64,
+        y: f64,
+    }
     #[repr(C)]
     #[derive(Copy, Clone)]
-    struct NSSize { width: f64, height: f64 }
+    struct NSSize {
+        width: f64,
+        height: f64,
+    }
     #[repr(C)]
     #[derive(Copy, Clone)]
-    struct NSRect { origin: NSPoint, size: NSSize }
+    struct NSRect {
+        origin: NSPoint,
+        size: NSSize,
+    }
 
     let ns_window_ptr = window.ns_window().map_err(|e| e.to_string())?;
     if ns_window_ptr.is_null() {
@@ -1166,7 +1205,10 @@ unsafe fn set_window_origin_unconstrained(
     // window.frame.origin is the window's bottom-left in Cocoa coords:
     //   cocoa_y = primary_height - logical_y - window_height
     let cocoa_y = primary_height - logical_y - window_height;
-    let origin = NSPoint { x: logical_x, y: cocoa_y };
+    let origin = NSPoint {
+        x: logical_x,
+        y: cocoa_y,
+    };
     let _: () = msg_send![ns_window, setFrameOrigin: origin];
     Ok(())
 }
@@ -1281,7 +1323,10 @@ async fn cmd_reattach_overlay(app: AppHandle, state: State<'_, AppState>) -> Res
 }
 
 #[tauri::command]
-async fn cmd_focus_active_session(app: AppHandle, state: State<'_, AppState>) -> Result<(), String> {
+async fn cmd_focus_active_session(
+    app: AppHandle,
+    state: State<'_, AppState>,
+) -> Result<(), String> {
     // Capture active session info and decide whether to dismiss the card.
     let active = {
         let mut model = state.model.lock().await;
@@ -1296,7 +1341,13 @@ async fn cmd_focus_active_session(app: AppHandle, state: State<'_, AppState>) ->
                     // actively running right now.
                     true
                 };
-                (session.app_kind, session.session_id.clone(), session.cwd.clone(), session.title.clone(), is_completed_or_idle)
+                (
+                    session.app_kind,
+                    session.session_id.clone(),
+                    session.cwd.clone(),
+                    session.title.clone(),
+                    is_completed_or_idle,
+                )
             });
 
         // If the active session is in a Completed/Idle state, mark it dismissed
@@ -1309,8 +1360,7 @@ async fn cmd_focus_active_session(app: AppHandle, state: State<'_, AppState>) ->
                     .map(|p| p.overlay.effective_state.clone());
                 let is_completed_state = matches!(
                     effective,
-                    Some(PetAnimationState::Waving)
-                        | Some(PetAnimationState::Idle)
+                    Some(PetAnimationState::Waving) | Some(PetAnimationState::Idle)
                 );
                 if is_completed_state {
                     model.dismissed_sessions.insert(session_id.clone());
@@ -1420,7 +1470,11 @@ pub fn run() {
                 model.config.pet_hidden
             };
             if let Some(window) = app.get_webview_window(OVERLAY_WINDOW_LABEL) {
-                let _ = if pet_hidden { window.hide() } else { window.show() };
+                let _ = if pet_hidden {
+                    window.hide()
+                } else {
+                    window.show()
+                };
             }
 
             // Lift overlay window level above the menu bar plane.  One-shot,
@@ -1458,8 +1512,14 @@ pub fn run() {
                 Ok(mut watcher) => {
                     if let Ok(home) = home_dir() {
                         let watches: [(PathBuf, RecursiveMode); 3] = [
-                            (home.join(".claude").join("projects"), RecursiveMode::Recursive),
-                            (home.join(".codex").join("sessions"), RecursiveMode::Recursive),
+                            (
+                                home.join(".claude").join("projects"),
+                                RecursiveMode::Recursive,
+                            ),
+                            (
+                                home.join(".codex").join("sessions"),
+                                RecursiveMode::Recursive,
+                            ),
                             (home.join(".codex"), RecursiveMode::NonRecursive),
                         ];
                         for (path, mode) in &watches {
@@ -1549,17 +1609,29 @@ fn build_tray(app: &mut tauri::App) -> tauri::Result<()> {
 
     let show_pet = MenuItemBuilder::with_id(
         "show_pet",
-        if is_korean { "펫 보이기/숨기기" } else { "Show / Hide Pet" },
+        if is_korean {
+            "펫 보이기/숨기기"
+        } else {
+            "Show / Hide Pet"
+        },
     )
     .build(app)?;
     let attach_pet = MenuItemBuilder::with_id(
         "attach_pet",
-        if is_korean { "Claude에 다시 붙이기" } else { "Attach to Claude" },
+        if is_korean {
+            "Claude에 다시 붙이기"
+        } else {
+            "Attach to Claude"
+        },
     )
     .build(app)?;
     let open_settings = MenuItemBuilder::with_id(
         "open_settings",
-        if is_korean { "설정 열기" } else { "Open Settings" },
+        if is_korean {
+            "설정 열기"
+        } else {
+            "Open Settings"
+        },
     )
     .build(app)?;
     let quit =
@@ -1633,12 +1705,11 @@ fn build_tray(app: &mut tauri::App) -> tauri::Result<()> {
 }
 
 async fn refresh_and_emit(app: &AppHandle, state: &AppState) -> Result<(), String> {
-    let (payload, pending_notifications) = {
+    let payload = {
         let mut model = state.model.lock().await;
-        let previously_seen_session_ids: HashSet<String> =
-            model.prev_in_progress.keys().cloned().collect();
         let mut payload = rebuild_payload(&mut model, &state.config_path)?;
-        let new_expected_pos = sync_overlay_window(app, &mut model.config, &state.config_path, &payload.overlay);
+        let new_expected_pos =
+            sync_overlay_window(app, &mut model.config, &state.config_path, &payload.overlay);
         if new_expected_pos.is_some() {
             model.expected_attached_position = new_expected_pos;
         }
@@ -1650,20 +1721,9 @@ async fn refresh_and_emit(app: &AppHandle, state: &AppState) -> Result<(), Strin
             }
             model.onboarding_shown = true;
         }
-        let pending_notifications = collect_notification_transitions(
-            &payload,
-            &previously_seen_session_ids,
-            &mut model.last_notified_state,
-            current_time_millis(),
-        );
         model.current_payload = Some(payload.clone());
-        (payload, pending_notifications)
+        payload
     };
-    if !pending_notifications.is_empty() {
-        tauri::async_runtime::spawn_blocking(move || {
-            dispatch_session_notifications(pending_notifications);
-        });
-    }
     app.emit(APP_EVENT, payload).map_err(|e| e.to_string())
 }
 
@@ -1686,7 +1746,10 @@ fn compute_cards_below(app: &AppHandle) -> bool {
     let Ok(monitors) = window.available_monitors() else {
         return false;
     };
-    let Ok(physical_x) = window.outer_position().map(|p| (p.x as f64 / scale).round() as i32) else {
+    let Ok(physical_x) = window
+        .outer_position()
+        .map(|p| (p.x as f64 / scale).round() as i32)
+    else {
         return false;
     };
     let pet_local_x = OVERLAY_WIDTH - PET_BOX_RIGHT - PET_BOX_WIDTH;
@@ -1889,17 +1952,14 @@ fn rebuild_payload(model: &mut RuntimeModel, config_path: &Path) -> Result<AppPa
             current_window_title: active_window_title(&windows, model, &sessions),
             effective_state,
             message_preview,
-            permission_granted: windows.claude.permission_granted || windows.codex.permission_granted,
+            permission_granted: windows.claude.permission_granted
+                || windows.codex.permission_granted,
             pet: pet_resolution.effective_pet,
             sessions,
             show_card,
             state_label: state_label(base_state).to_string(),
             dismissed_session_ids: model.dismissed_sessions.iter().cloned().collect(),
-            completed_runtime_session_ids: model
-                .completed_during_runtime
-                .iter()
-                .cloned()
-                .collect(),
+            completed_runtime_session_ids: model.completed_during_runtime.iter().cloned().collect(),
             // Computed by `refresh_and_emit` based on the live overlay window
             // position; defaulted here.
             cards_below: false,
@@ -2066,43 +2126,51 @@ fn lift_dismiss_on_in_progress(
 
 /// Apply B-medium rule: force `in_progress = false` when the owning process
 /// is not running, or when `last_activity_at` is more than 3 minutes stale.
-fn clear_stale_in_progress(sessions: Vec<SessionSummary>, windows: &FrontWindowState) -> Vec<SessionSummary> {
+fn clear_stale_in_progress(
+    sessions: Vec<SessionSummary>,
+    windows: &FrontWindowState,
+) -> Vec<SessionSummary> {
     const STALE_THRESHOLD_MS: u64 = 180_000; // 3 minutes
     let now_ms = SystemTime::now()
         .duration_since(SystemTime::UNIX_EPOCH)
         .unwrap_or_default()
         .as_millis() as u64;
 
-    sessions.into_iter().map(|mut session| {
-        if !session.in_progress {
-            return session;
-        }
-        let app_running = is_app_running(windows, session.app_kind);
-        if !app_running {
-            eprintln!(
-                "[InProgress] session {} forced idle: app {:?} not running",
-                session.session_id, session.app_kind
-            );
-            session.in_progress = false;
-            return session;
-        }
-        let age_ms = now_ms.saturating_sub(session.last_activity_at);
-        if age_ms > STALE_THRESHOLD_MS {
-            eprintln!(
+    sessions
+        .into_iter()
+        .map(|mut session| {
+            if !session.in_progress {
+                return session;
+            }
+            // Only trust the "app not running" branch when process detection
+            // actually succeeded.  When `detection_ok == false` both JXA and
+            // AppleScript probes failed (typically TCC Automation denial after
+            // `pnpm tauri dev` re-signs the binary) — in that case both
+            // `claude_running` and `codex_running` are false-by-default which
+            // would otherwise force-idle every session and hide all cards.
+            // The 3-minute stale fallback below still applies regardless.
+            if windows.detection_ok {
+                let app_running = is_app_running(windows, session.app_kind);
+                if !app_running {
+                    eprintln!(
+                        "[InProgress] session {} forced idle: app {:?} not running",
+                        session.session_id, session.app_kind
+                    );
+                    session.in_progress = false;
+                    return session;
+                }
+            }
+            let age_ms = now_ms.saturating_sub(session.last_activity_at);
+            if age_ms > STALE_THRESHOLD_MS {
+                eprintln!(
                 "[InProgress] session {} forced idle: last_activity {}ms ago (>{} ms threshold)",
                 session.session_id, age_ms, STALE_THRESHOLD_MS
             );
-            let _ = std::fs::write(
-                "/tmp/pet-companion-stale.log",
-                format!(
-                    "session={} forced idle: age_ms={} threshold={}\n",
-                    session.session_id, age_ms, STALE_THRESHOLD_MS
-                ),
-            );
-            session.in_progress = false;
-        }
-        session
-    }).collect()
+                session.in_progress = false;
+            }
+            session
+        })
+        .collect()
 }
 
 fn active_window_title(
@@ -2150,7 +2218,10 @@ fn decode_window_info(value: Option<&Value>, permission_granted: bool) -> Claude
     }
 }
 
-fn detect_turn_completion(model: &mut RuntimeModel, active_session: Option<&SessionSummary>) -> bool {
+fn detect_turn_completion(
+    model: &mut RuntimeModel,
+    active_session: Option<&SessionSummary>,
+) -> bool {
     let Some(session) = active_session else {
         return false;
     };
@@ -2213,145 +2284,6 @@ fn state_label(state: BaseState) -> &'static str {
     }
 }
 
-fn session_visual_state_for_notification(
-    session: &SessionSummary,
-    active_session_id: Option<&str>,
-    overlay_effective_state: &PetAnimationState,
-    completed_runtime_session_ids: &HashSet<&str>,
-    now_ms: u64,
-) -> PetAnimationState {
-    if active_session_id == Some(session.session_id.as_str()) {
-        return overlay_effective_state.clone();
-    }
-    if session.in_progress {
-        let age_ms = now_ms.saturating_sub(session.last_activity_at);
-        return if age_ms > WAITING_THRESHOLD_MS {
-            PetAnimationState::Waiting
-        } else {
-            PetAnimationState::Running
-        };
-    }
-    if completed_runtime_session_ids.contains(session.session_id.as_str()) {
-        return PetAnimationState::Waving;
-    }
-    PetAnimationState::Idle
-}
-
-fn notification_state_key(state: &PetAnimationState) -> Option<&'static str> {
-    match state {
-        PetAnimationState::Waiting => Some("waiting"),
-        PetAnimationState::Waving => Some("waving"),
-        _ => None,
-    }
-}
-
-fn notification_body(state: &PetAnimationState) -> Option<&'static str> {
-    match state {
-        PetAnimationState::Waiting => Some("입력이 필요합니다"),
-        PetAnimationState::Waving => Some("작업이 완료됐습니다"),
-        _ => None,
-    }
-}
-
-fn app_display_name(app: SessionApp) -> &'static str {
-    match app {
-        SessionApp::Claude => "Claude",
-        SessionApp::Codex => "Codex",
-    }
-}
-
-fn project_label_from_cwd(cwd: &str) -> Option<String> {
-    let path = Path::new(cwd);
-    path.file_name()
-        .and_then(|name| name.to_str())
-        .filter(|name| !name.is_empty())
-        .map(str::to_string)
-        .or_else(|| {
-            cwd.rsplit('/')
-                .find(|segment| !segment.is_empty())
-                .map(str::to_string)
-        })
-}
-
-fn notification_subtitle(session: &SessionSummary) -> String {
-    let project = project_label_from_cwd(&session.cwd)
-        .filter(|value| !value.is_empty())
-        .unwrap_or_else(|| session.title.clone());
-    format!("{project} · {}", app_display_name(session.app_kind))
-}
-
-fn collect_notification_transitions(
-    payload: &AppPayload,
-    previously_seen_session_ids: &HashSet<String>,
-    last_notified_state: &mut HashMap<String, String>,
-    now_ms: u64,
-) -> Vec<SessionNotification> {
-    let live_ids: HashSet<&str> = payload
-        .overlay
-        .sessions
-        .iter()
-        .map(|session| session.session_id.as_str())
-        .collect();
-    last_notified_state.retain(|session_id, _| live_ids.contains(session_id.as_str()));
-
-    let active_session_id = payload
-        .overlay
-        .active_session
-        .as_ref()
-        .map(|session| session.session_id.as_str());
-    let completed_runtime_session_ids: HashSet<&str> = payload
-        .overlay
-        .completed_runtime_session_ids
-        .iter()
-        .map(String::as_str)
-        .collect();
-
-    let mut notifications = Vec::new();
-    for session in &payload.overlay.sessions {
-        let state = session_visual_state_for_notification(
-            session,
-            active_session_id,
-            &payload.overlay.effective_state,
-            &completed_runtime_session_ids,
-            now_ms,
-        );
-
-        if matches!(state, PetAnimationState::Running) {
-            last_notified_state.remove(&session.session_id);
-            continue;
-        }
-
-        let Some(state_key) = notification_state_key(&state) else {
-            continue;
-        };
-
-        if !previously_seen_session_ids.contains(&session.session_id) {
-            last_notified_state.insert(session.session_id.clone(), state_key.to_string());
-            continue;
-        }
-
-        if last_notified_state
-            .get(&session.session_id)
-            .map(String::as_str)
-            == Some(state_key)
-        {
-            continue;
-        }
-
-        last_notified_state.insert(session.session_id.clone(), state_key.to_string());
-        if let Some(body) = notification_body(&state) {
-            notifications.push(SessionNotification {
-                session_id: session.session_id.clone(),
-                state,
-                subtitle: notification_subtitle(session),
-                body: body.to_string(),
-            });
-        }
-    }
-
-    notifications
-}
-
 fn should_show_card(state: &PetAnimationState, claude_frontmost: bool) -> bool {
     if !claude_frontmost {
         return true;
@@ -2359,9 +2291,7 @@ fn should_show_card(state: &PetAnimationState, claude_frontmost: bool) -> bool {
 
     matches!(
         state,
-        PetAnimationState::Running
-            | PetAnimationState::Waiting
-            | PetAnimationState::Jumping
+        PetAnimationState::Running | PetAnimationState::Waiting | PetAnimationState::Jumping
     )
 }
 
@@ -2374,9 +2304,10 @@ fn read_message_preview(
 
     if session.app_kind == SessionApp::Codex {
         let selected = match base_state {
-            BaseState::Running | BaseState::Waiting => {
-                session.user_preview.clone().or_else(|| session.assistant_preview.clone())
-            }
+            BaseState::Running | BaseState::Waiting => session
+                .user_preview
+                .clone()
+                .or_else(|| session.assistant_preview.clone()),
             BaseState::Completed | BaseState::Idle => session
                 .completed_preview
                 .clone()
@@ -2606,12 +2537,9 @@ fn read_codex_global_state() -> Result<CodexGlobalState, String> {
     if !path.exists() {
         return Ok(CodexGlobalState::default());
     }
-    let value: Value =
-        serde_json::from_str(&fs::read_to_string(&path).map_err(|e| e.to_string())?)
-            .map_err(|e| e.to_string())?;
-    let persisted = value
-        .get("electron-persisted-atom-state")
-        .unwrap_or(&value);
+    let value: Value = serde_json::from_str(&fs::read_to_string(&path).map_err(|e| e.to_string())?)
+        .map_err(|e| e.to_string())?;
+    let persisted = value.get("electron-persisted-atom-state").unwrap_or(&value);
     let selected = persisted
         .get("selected-avatar-id")
         .and_then(Value::as_str)
@@ -2652,9 +2580,7 @@ fn read_claude_sessions() -> Result<Vec<SessionSummary>, String> {
     })?;
 
     // Sort newest-modified first so the `take` below keeps recent sessions.
-    jsonl_paths.sort_by_key(|p| {
-        fs::metadata(p).and_then(|m| m.modified()).ok()
-    });
+    jsonl_paths.sort_by_key(|p| fs::metadata(p).and_then(|m| m.modified()).ok());
     jsonl_paths.reverse();
 
     let mut sessions = Vec::new();
@@ -2757,10 +2683,7 @@ fn read_claude_session_file(path: &Path) -> Result<Option<SessionSummary>, Strin
 
         // User messages: extract text content for title / preview.
         if msg_type == Some("user") {
-            if let Some(content) = value
-                .get("message")
-                .and_then(|m| m.get("content"))
-            {
+            if let Some(content) = value.get("message").and_then(|m| m.get("content")) {
                 if let Some(preview) = extract_preview_text(content) {
                     if first_user_text.is_none() {
                         first_user_text = Some(preview.clone());
@@ -2773,10 +2696,7 @@ fn read_claude_session_file(path: &Path) -> Result<Option<SessionSummary>, Strin
         // Assistant messages: count turns and capture preview.
         if msg_type == Some("assistant") {
             completed_turns += 1;
-            if let Some(content) = value
-                .get("message")
-                .and_then(|m| m.get("content"))
-            {
+            if let Some(content) = value.get("message").and_then(|m| m.get("content")) {
                 if let Some(preview) = extract_preview_text(content) {
                     latest_assistant = Some(preview);
                 }
@@ -2909,7 +2829,8 @@ fn read_codex_session_file(path: &Path) -> Result<Option<SessionSummary>, String
                     Some("task_complete") => {
                         in_progress = false;
                         completed_turns += 1;
-                        if let Some(text) = payload.get("last_agent_message").and_then(Value::as_str)
+                        if let Some(text) =
+                            payload.get("last_agent_message").and_then(Value::as_str)
                         {
                             latest_completed = sanitize_preview(text);
                         }
@@ -3041,16 +2962,26 @@ fn dedup_sessions_by_workspace(sessions: Vec<SessionSummary>) -> Vec<SessionSumm
         if let Some(existing) = map.get_mut(&key) {
             if session.last_activity_at > existing.last_activity_at {
                 // Incoming is newer: take its id/title/timestamp, merge the rest.
-                let merged_turns = session.completed_turns.unwrap_or(0)
+                let merged_turns = session
+                    .completed_turns
+                    .unwrap_or(0)
                     .max(existing.completed_turns.unwrap_or(0));
                 let merged_in_progress = session.in_progress || existing.in_progress;
-                let merged_user = session.user_preview.clone()
+                let merged_user = session
+                    .user_preview
+                    .clone()
                     .or_else(|| existing.user_preview.clone());
-                let merged_assistant = session.assistant_preview.clone()
+                let merged_assistant = session
+                    .assistant_preview
+                    .clone()
                     .or_else(|| existing.assistant_preview.clone());
-                let merged_completed = session.completed_preview.clone()
+                let merged_completed = session
+                    .completed_preview
+                    .clone()
                     .or_else(|| existing.completed_preview.clone());
-                let merged_cli = session.cli_session_id.clone()
+                let merged_cli = session
+                    .cli_session_id
+                    .clone()
                     .or_else(|| existing.cli_session_id.clone());
                 *existing = SessionSummary {
                     last_activity_at: session.last_activity_at,
@@ -3069,7 +3000,9 @@ fn dedup_sessions_by_workspace(sessions: Vec<SessionSummary>) -> Vec<SessionSumm
             } else {
                 // Existing is newer: just fill gaps.
                 existing.completed_turns = Some(
-                    existing.completed_turns.unwrap_or(0)
+                    existing
+                        .completed_turns
+                        .unwrap_or(0)
                         .max(session.completed_turns.unwrap_or(0)),
                 );
                 existing.in_progress = existing.in_progress || session.in_progress;
@@ -3184,19 +3117,50 @@ try {
         .arg(script)
         .output();
 
-    let Ok(output) = output else {
-        return FrontWindowState::default();
+    let output = match output {
+        Ok(out) => out,
+        Err(err) => {
+            eprintln!(
+                "[ProcessDetect] JXA osascript spawn failed: {} — falling back to AppleScript probe",
+                err
+            );
+            return applescript_process_probe_fallback();
+        }
     };
 
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        eprintln!(
+            "[ProcessDetect] JXA exited non-zero (status={:?}) stderr={:?} — falling back to AppleScript probe",
+            output.status.code(),
+            stderr.trim()
+        );
+        return applescript_process_probe_fallback();
+    }
+
     let stdout = String::from_utf8_lossy(&output.stdout);
-    let Ok(value) = serde_json::from_str::<Value>(stdout.trim()) else {
-        return FrontWindowState::default();
+    let value = match serde_json::from_str::<Value>(stdout.trim()) {
+        Ok(v) => v,
+        Err(err) => {
+            eprintln!(
+                "[ProcessDetect] JXA JSON parse failed: {} stdout={:?} — falling back to AppleScript probe",
+                err,
+                stdout.trim()
+            );
+            return applescript_process_probe_fallback();
+        }
     };
 
     let permission_granted = value
         .get("permissionGranted")
         .and_then(Value::as_bool)
         .unwrap_or(false);
+    if !permission_granted {
+        eprintln!(
+            "[ProcessDetect] JXA returned permissionGranted=false — falling back to AppleScript probe"
+        );
+        return applescript_process_probe_fallback();
+    }
     let frontmost_app = value
         .get("frontmostApp")
         .and_then(Value::as_str)
@@ -3210,11 +3174,9 @@ try {
         .and_then(Value::as_bool)
         .unwrap_or(false);
 
-    eprintln!("[ProcessDetect] claudeRunning={}, codexRunning={}", claude_running, codex_running);
-    // Write to a temp file so harness-captured runs can still be verified.
-    let _ = std::fs::write(
-        "/tmp/pet-companion-detect.log",
-        format!("claudeRunning={} codexRunning={}\n", claude_running, codex_running),
+    eprintln!(
+        "[ProcessDetect] JXA OK: claudeRunning={}, codexRunning={}",
+        claude_running, codex_running
     );
 
     FrontWindowState {
@@ -3223,6 +3185,86 @@ try {
         frontmost_app,
         claude_running,
         codex_running,
+        detection_ok: true,
+    }
+}
+
+/// AppleScript-based fallback for detecting whether Claude / Codex processes
+/// are running.  Used when the JXA probe in `query_supported_front_windows`
+/// fails (osascript spawn error, non-zero exit, unparseable JSON, or
+/// `permissionGranted=false`).
+///
+/// AppleScript's `tell application "System Events"` uses a slightly different
+/// Apple-event surface than JXA's `Application("System Events")` and tends
+/// to be more forgiving — especially in dev builds where TCC Automation has
+/// been freshly invalidated by re-signing.
+///
+/// On success returns a partial `FrontWindowState` with only `claude_running`
+/// / `codex_running` / `detection_ok=true` populated (window geometry +
+/// frontmost remain default — accessibility data still requires the full
+/// JXA path).  On failure returns `FrontWindowState::default()` with
+/// `detection_ok=false`, signalling to `clear_stale_in_progress` that the
+/// "app not running" branch must NOT force-idle sessions.
+fn parse_process_names(stdout: &str) -> (bool, bool) {
+    let names: Vec<&str> = stdout
+        .split(',')
+        .map(|name| name.trim())
+        .filter(|name| !name.is_empty())
+        .collect();
+    let claude_running = names.contains(&"Claude");
+    let codex_running = names
+        .iter()
+        .any(|name| *name == "Codex" || *name == "Codex CLI");
+    (claude_running, codex_running)
+}
+
+fn applescript_process_probe_fallback() -> FrontWindowState {
+    let output = Command::new("osascript")
+        .arg("-e")
+        .arg(r#"tell application "System Events" to get name of every process"#)
+        .output();
+
+    let output = match output {
+        Ok(out) => out,
+        Err(err) => {
+            eprintln!(
+                "[ProcessDetect] AppleScript fallback spawn failed: {} — detection_ok=false",
+                err
+            );
+            return FrontWindowState::default();
+        }
+    };
+
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        eprintln!(
+            "[ProcessDetect] AppleScript fallback non-zero (status={:?}) stderr={:?} — detection_ok=false",
+            output.status.code(),
+            stderr.trim()
+        );
+        return FrontWindowState::default();
+    }
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let (claude_running, codex_running) = parse_process_names(stdout.as_ref());
+    let process_count = stdout
+        .split(',')
+        .map(|name| name.trim())
+        .filter(|name| !name.is_empty())
+        .count();
+
+    eprintln!(
+        "[ProcessDetect] AppleScript fallback OK: claudeRunning={}, codexRunning={} (process_count={})",
+        claude_running,
+        codex_running,
+        process_count
+    );
+
+    FrontWindowState {
+        claude_running,
+        codex_running,
+        detection_ok: true,
+        ..Default::default()
     }
 }
 
@@ -3260,7 +3302,8 @@ fn sync_overlay_window(
         SessionApp::Claude => &windows.claude,
         SessionApp::Codex => &windows.codex,
     };
-    let owner_frontmost = matches!(windows.frontmost_app, Some(app) if app == active_session.app_kind);
+    let owner_frontmost =
+        matches!(windows.frontmost_app, Some(app) if app == active_session.app_kind);
 
     if owner_frontmost
         && current_window.permission_granted
@@ -3345,123 +3388,6 @@ fn escape_applescript(value: &str) -> String {
     value.replace('\\', "\\\\").replace('"', "\\\"")
 }
 
-fn frontmost_app_name_via_jxa() -> Result<String, String> {
-    let script = r#"
-try {
-  const name = Application("System Events").frontmostApplication().name();
-  console.log(String(name || ""));
-} catch (err) {
-  console.log(`ERROR:${String(err)}`);
-}
-"#;
-
-    let output = Command::new("osascript")
-        .arg("-l")
-        .arg("JavaScript")
-        .arg("-e")
-        .arg(script)
-        .output()
-        .map_err(|e| e.to_string())?;
-
-    if !output.status.success() {
-        return Err(String::from_utf8_lossy(&output.stderr).trim().to_string());
-    }
-
-    let stdout = String::from_utf8_lossy(&output.stdout).trim().to_string();
-    if let Some(err) = stdout.strip_prefix("ERROR:") {
-        return Err(err.trim().to_string());
-    }
-
-    Ok(stdout)
-}
-
-#[cfg(target_os = "macos")]
-fn frontmost_app_name_via_nsworkspace() -> Option<String> {
-    use std::ffi::CStr;
-    use std::os::raw::c_char;
-
-    use objc::runtime::Object;
-    use objc::{class, msg_send, sel, sel_impl};
-
-    unsafe {
-        let workspace: *mut Object = msg_send![class!(NSWorkspace), sharedWorkspace];
-        if workspace.is_null() {
-            return None;
-        }
-        let frontmost_app: *mut Object = msg_send![workspace, frontmostApplication];
-        if frontmost_app.is_null() {
-            return None;
-        }
-        let localized_name: *mut Object = msg_send![frontmost_app, localizedName];
-        if localized_name.is_null() {
-            return None;
-        }
-        let utf8: *const c_char = msg_send![localized_name, UTF8String];
-        if utf8.is_null() {
-            return None;
-        }
-        Some(CStr::from_ptr(utf8).to_string_lossy().into_owned())
-    }
-}
-
-#[cfg(not(target_os = "macos"))]
-fn frontmost_app_name_via_nsworkspace() -> Option<String> {
-    None
-}
-
-fn is_pet_companion_frontmost() -> Result<bool, String> {
-    match frontmost_app_name_via_jxa() {
-        Ok(name) => Ok(name == "Pet Companion"),
-        Err(jxa_err) => {
-            if let Some(name) = frontmost_app_name_via_nsworkspace() {
-                eprintln!("[notify] JXA frontmost check failed, used NSWorkspace fallback: {jxa_err}");
-                return Ok(name == "Pet Companion");
-            }
-            Err(jxa_err)
-        }
-    }
-}
-
-fn send_session_notification(notification: &SessionNotification) {
-    let title = escape_applescript("Pet Companion");
-    let subtitle = escape_applescript(&notification.subtitle);
-    let body = escape_applescript(&notification.body);
-    let script = format!(
-        r#"display notification "{body}" with title "{title}" subtitle "{subtitle}""#
-    );
-    match Command::new("osascript").arg("-e").arg(&script).output() {
-        Ok(output) if output.status.success() => {}
-        Ok(output) => {
-            eprintln!(
-                "[notify] notification failed session_id={} state={:?}: {}",
-                notification.session_id,
-                notification.state,
-                String::from_utf8_lossy(&output.stderr).trim()
-            );
-        }
-        Err(err) => {
-            eprintln!(
-                "[notify] notification command failed session_id={} state={:?}: {}",
-                notification.session_id, notification.state, err
-            );
-        }
-    }
-}
-
-fn dispatch_session_notifications(notifications: Vec<SessionNotification>) {
-    match is_pet_companion_frontmost() {
-        Ok(true) => {}
-        Ok(false) => {
-            for notification in &notifications {
-                send_session_notification(notification);
-            }
-        }
-        Err(err) => {
-            eprintln!("[notify] frontmost check failed: {err}");
-        }
-    }
-}
-
 fn open_url(url: &str) -> Result<(), String> {
     Command::new("open")
         .arg(url)
@@ -3530,7 +3456,10 @@ fn position_overlay_at_startup(app: &mut tauri::App) {
     if let Some(pos) = &model.config.detached_position {
         let (next_x, next_y) = clamp_overlay_position(&window, pet_scale, pos.x, pos.y);
         let _ = window.set_position(LogicalPosition::new(next_x, next_y));
-        model.config.detached_position = Some(SavedPosition { x: next_x, y: next_y });
+        model.config.detached_position = Some(SavedPosition {
+            x: next_x,
+            y: next_y,
+        });
         let _ = persist_config(&state.config_path, &model.config);
         return;
     }
@@ -3560,12 +3489,12 @@ fn safe_home_position(window: &tauri::WebviewWindow) -> (i32, i32) {
         //   • top  — reserve room for the macOS menu bar
         //   • bottom — ATTACHED_MARGIN_Y keeps it off the dock edge
         //   • right  — ATTACHED_MARGIN_X keeps it off the screen edge
-        let overlay_x = (x + width - OVERLAY_WIDTH - ATTACHED_MARGIN_X)
-            .clamp(x, x + width - OVERLAY_WIDTH);
+        let overlay_x =
+            (x + width - OVERLAY_WIDTH - ATTACHED_MARGIN_X).clamp(x, x + width - OVERLAY_WIDTH);
         let min_y = y + MACOS_MENU_BAR_HEIGHT;
         let max_y = y + height - OVERLAY_HEIGHT - ATTACHED_MARGIN_Y;
-        let overlay_y = (y + height - OVERLAY_HEIGHT - ATTACHED_MARGIN_Y)
-            .clamp(min_y, max_y.max(min_y));
+        let overlay_y =
+            (y + height - OVERLAY_HEIGHT - ATTACHED_MARGIN_Y).clamp(min_y, max_y.max(min_y));
         (overlay_x, overlay_y)
     };
 
@@ -3626,8 +3555,7 @@ fn clamp_overlay_position(
     // in L-shaped arrangements the pet could enter a corner gap that isn't
     // covered by any monitor — acceptable for now; users won't typically
     // drag into a dead corner.
-    let frames: Vec<(i32, i32, i32, i32)> =
-        monitors.iter().map(logical_monitor_frame).collect();
+    let frames: Vec<(i32, i32, i32, i32)> = monitors.iter().map(logical_monitor_frame).collect();
     let union_min_x = frames.iter().map(|f| f.0).min().unwrap_or(0);
     let union_min_y = frames.iter().map(|f| f.1).min().unwrap_or(0);
     let union_max_x = frames.iter().map(|f| f.0 + f.2).max().unwrap_or(0);
@@ -3643,10 +3571,7 @@ fn clamp_overlay_position(
     let clamped_cx = pet_center_x.clamp(min_cx, max_cx.max(min_cx));
     let clamped_cy = pet_center_y.clamp(min_cy, max_cy.max(min_cy));
 
-    (
-        clamped_cx - center_offset_x,
-        clamped_cy - center_offset_y,
-    )
+    (clamped_cx - center_offset_x, clamped_cy - center_offset_y)
 }
 
 fn logical_monitor_frame(monitor: &tauri::Monitor) -> (i32, i32, i32, i32) {
@@ -3732,56 +3657,27 @@ mod tests {
         FrontWindowState {
             claude_running: true,
             codex_running: true,
+            detection_ok: true,
             ..Default::default()
         }
     }
 
-    fn notification_payload(
-        active_session: Option<SessionSummary>,
-        sessions: Vec<SessionSummary>,
-        effective_state: PetAnimationState,
-        completed_runtime_session_ids: &[&str],
-    ) -> AppPayload {
-        AppPayload {
-            codex_selected_pet_id: None,
-            config: FrontendConfig {
-                attached: true,
-                language: "ko".to_string(),
-                manual_session_app: None,
-                manual_session_id: None,
-                pet_override_id: None,
-                pet_scale: 1.0,
-                tracked_app: "auto".to_string(),
-            },
-            overlay: OverlaySnapshot {
-                active_session,
-                claude_frontmost: false,
-                codex_frontmost: false,
-                current_window_title: None,
-                effective_state,
-                message_preview: None,
-                manual_session_missing: false,
-                manual_session_pinned: false,
-                permission_granted: true,
-                pet: PetDescriptor {
-                    description: String::new(),
-                    display_name: "Bori".to_string(),
-                    id: "bori".to_string(),
-                    source: "custom".to_string(),
-                    sprite_sheet_path: String::new(),
-                },
-                sessions,
-                show_card: true,
-                state_label: "Idle".to_string(),
-                dismissed_session_ids: vec![],
-                completed_runtime_session_ids: completed_runtime_session_ids
-                    .iter()
-                    .map(|id| (*id).to_string())
-                    .collect(),
-                cards_below: false,
-            },
-            pets: vec![],
-        }
+    #[test]
+    fn parse_process_names_detects_claude_and_codex() {
+        let (claude_running, codex_running) = parse_process_names("Claude, Codex, Finder");
+        assert_eq!((claude_running, codex_running), (true, true));
+    }
+
+    #[test]
+    fn parse_process_names_detects_codex_cli_with_spaces() {
+        let (claude_running, codex_running) = parse_process_names("Codex CLI, Safari");
+        assert_eq!((claude_running, codex_running), (false, true));
+    }
+
+    #[test]
+    fn parse_process_names_handles_empty_stdout() {
+        let (claude_running, codex_running) = parse_process_names("");
+        assert_eq!((claude_running, codex_running), (false, false));
     }
 
     fn now_ms() -> u64 {
@@ -3805,7 +3701,10 @@ mod tests {
 
         update_completion_tracking(&sessions, &mut dismissed, &mut completed, &mut prev);
 
-        assert!(completed.is_empty(), "first observation should not mark completed");
+        assert!(
+            completed.is_empty(),
+            "first observation should not mark completed"
+        );
         assert_eq!(prev.get("s1"), Some(&true));
     }
 
@@ -3821,7 +3720,10 @@ mod tests {
 
         update_completion_tracking(&sessions, &mut dismissed, &mut completed, &mut prev);
 
-        assert!(completed.is_empty(), "first observation (false) must not mark completed");
+        assert!(
+            completed.is_empty(),
+            "first observation (false) must not mark completed"
+        );
         assert_eq!(prev.get("s1"), Some(&false));
     }
 
@@ -3849,7 +3751,10 @@ mod tests {
             &mut completed,
             &mut prev,
         );
-        assert!(completed.contains("s1"), "true→false transition must mark completed");
+        assert!(
+            completed.contains("s1"),
+            "true→false transition must mark completed"
+        );
         assert_eq!(prev.get("s1"), Some(&false));
     }
 
@@ -3860,28 +3765,56 @@ mod tests {
         let mut prev = HashMap::new();
 
         // Build up the completed-runtime marker.
-        update_completion_tracking(&[session("s1", true, 1_000)], &mut dismissed, &mut completed, &mut prev);
-        update_completion_tracking(&[session("s1", false, 2_000)], &mut dismissed, &mut completed, &mut prev);
+        update_completion_tracking(
+            &[session("s1", true, 1_000)],
+            &mut dismissed,
+            &mut completed,
+            &mut prev,
+        );
+        update_completion_tracking(
+            &[session("s1", false, 2_000)],
+            &mut dismissed,
+            &mut completed,
+            &mut prev,
+        );
         assert!(completed.contains("s1"));
 
         // New turn starts — the runtime-completed marker must be cleared so
         // the card flips back to "진행 중".
-        update_completion_tracking(&[session("s1", true, 3_000)], &mut dismissed, &mut completed, &mut prev);
-        assert!(!completed.contains("s1"), "re-entering in_progress must clear completed marker");
+        update_completion_tracking(
+            &[session("s1", true, 3_000)],
+            &mut dismissed,
+            &mut completed,
+            &mut prev,
+        );
+        assert!(
+            !completed.contains("s1"),
+            "re-entering in_progress must clear completed marker"
+        );
     }
 
     #[test]
     fn update_completion_tracking_prunes_disappeared_sessions() {
         let mut dismissed: HashSet<String> = vec!["gone".to_string()].into_iter().collect();
         let mut completed: HashSet<String> = vec!["gone".to_string()].into_iter().collect();
-        let mut prev: HashMap<String, bool> = vec![("gone".to_string(), true)].into_iter().collect();
+        let mut prev: HashMap<String, bool> =
+            vec![("gone".to_string(), true)].into_iter().collect();
 
         let live_sessions = vec![session("s1", true, 1_000)];
         update_completion_tracking(&live_sessions, &mut dismissed, &mut completed, &mut prev);
 
-        assert!(!dismissed.contains("gone"), "disappeared session must be pruned from dismissed");
-        assert!(!completed.contains("gone"), "disappeared session must be pruned from completed");
-        assert!(!prev.contains_key("gone"), "disappeared session must be pruned from prev_in_progress");
+        assert!(
+            !dismissed.contains("gone"),
+            "disappeared session must be pruned from dismissed"
+        );
+        assert!(
+            !completed.contains("gone"),
+            "disappeared session must be pruned from completed"
+        );
+        assert!(
+            !prev.contains_key("gone"),
+            "disappeared session must be pruned from prev_in_progress"
+        );
     }
 
     #[test]
@@ -3900,16 +3833,29 @@ mod tests {
         let mut prev = HashMap::new();
 
         // Old rollout id sees in_progress=true.
-        update_completion_tracking(&[session("old-id", true, 1_000)], &mut dismissed, &mut completed, &mut prev);
+        update_completion_tracking(
+            &[session("old-id", true, 1_000)],
+            &mut dismissed,
+            &mut completed,
+            &mut prev,
+        );
         assert_eq!(prev.get("old-id"), Some(&true));
 
         // Next tick: dedup swapped to a new rollout id (different session_id),
         // and the new id reports in_progress=false.
-        update_completion_tracking(&[session("new-id", false, 2_000)], &mut dismissed, &mut completed, &mut prev);
+        update_completion_tracking(
+            &[session("new-id", false, 2_000)],
+            &mut dismissed,
+            &mut completed,
+            &mut prev,
+        );
 
         // `new-id` was never seen before — no transition can be detected.
         // `old-id` is pruned.  Completed stays empty.
-        assert!(completed.is_empty(), "session-id swap must NOT spuriously mark completed");
+        assert!(
+            completed.is_empty(),
+            "session-id swap must NOT spuriously mark completed"
+        );
         assert!(!prev.contains_key("old-id"), "old id must be pruned");
         assert_eq!(prev.get("new-id"), Some(&false));
     }
@@ -3918,20 +3864,30 @@ mod tests {
 
     #[test]
     fn lift_dismiss_only_removes_in_progress_sessions() {
-        let mut dismissed: HashSet<String> = vec!["a".to_string(), "b".to_string(), "c".to_string()]
-            .into_iter()
-            .collect();
+        let mut dismissed: HashSet<String> =
+            vec!["a".to_string(), "b".to_string(), "c".to_string()]
+                .into_iter()
+                .collect();
 
         let sessions = vec![
-            session("a", true, 1_000),   // should be lifted
-            session("b", false, 1_000),  // stays dismissed
-            session("c", false, 1_000),  // stays dismissed
+            session("a", true, 1_000),  // should be lifted
+            session("b", false, 1_000), // stays dismissed
+            session("c", false, 1_000), // stays dismissed
         ];
         lift_dismiss_on_in_progress(&sessions, &mut dismissed);
 
-        assert!(!dismissed.contains("a"), "in_progress=true must lift dismiss");
-        assert!(dismissed.contains("b"), "in_progress=false must keep dismiss");
-        assert!(dismissed.contains("c"), "in_progress=false must keep dismiss");
+        assert!(
+            !dismissed.contains("a"),
+            "in_progress=true must lift dismiss"
+        );
+        assert!(
+            dismissed.contains("b"),
+            "in_progress=false must keep dismiss"
+        );
+        assert!(
+            dismissed.contains("c"),
+            "in_progress=false must keep dismiss"
+        );
     }
 
     #[test]
@@ -3946,7 +3902,8 @@ mod tests {
     fn lift_dismiss_handles_unrelated_in_progress_correctly() {
         // CLAUDE.md policy: only the *same* session re-entering in_progress
         // unblocks its dismiss.  Other sessions running do not affect it.
-        let mut dismissed: HashSet<String> = vec!["dismissed-one".to_string()].into_iter().collect();
+        let mut dismissed: HashSet<String> =
+            vec!["dismissed-one".to_string()].into_iter().collect();
         let sessions = vec![
             session("dismissed-one", false, 1_000), // still completed/idle
             session("active-other", true, 2_000),   // unrelated running session
@@ -3973,10 +3930,33 @@ mod tests {
         let windows = FrontWindowState {
             claude_running: false,
             codex_running: true,
+            detection_ok: true,
             ..Default::default()
         };
         let result = clear_stale_in_progress(vec![s], &windows);
-        assert!(!result[0].in_progress, "must force false when owning app is not running");
+        assert!(
+            !result[0].in_progress,
+            "must force false when owning app is not running"
+        );
+    }
+
+    #[test]
+    fn clear_stale_in_progress_keeps_in_progress_when_detection_failed() {
+        // Detection probe failed (both JXA and AppleScript denied by TCC).
+        // We must NOT force-idle all sessions just because both running flags
+        // are false-by-default — that would hide every card.
+        let s = session("s1", true, now_ms());
+        let windows = FrontWindowState {
+            claude_running: false,
+            codex_running: false,
+            detection_ok: false,
+            ..Default::default()
+        };
+        let result = clear_stale_in_progress(vec![s], &windows);
+        assert!(
+            result[0].in_progress,
+            "must keep in_progress when process detection itself failed"
+        );
     }
 
     #[test]
@@ -3984,7 +3964,10 @@ mod tests {
         let stale_at = now_ms().saturating_sub(4 * 60 * 1000); // 4 minutes ago
         let s = session("s1", true, stale_at);
         let result = clear_stale_in_progress(vec![s], &windows_both_running());
-        assert!(!result[0].in_progress, "must force false when activity is > 3 min stale");
+        assert!(
+            !result[0].in_progress,
+            "must force false when activity is > 3 min stale"
+        );
     }
 
     #[test]
@@ -4005,7 +3988,10 @@ mod tests {
         // this as a runtime completion — we never witnessed the true phase.
         let stale = session("s1", true, now_ms().saturating_sub(5 * 60 * 1000));
         let after_stale = clear_stale_in_progress(vec![stale], &windows_both_running());
-        assert!(!after_stale[0].in_progress, "stale clear should have forced false");
+        assert!(
+            !after_stale[0].in_progress,
+            "stale clear should have forced false"
+        );
 
         let mut dismissed = HashSet::new();
         let mut completed = HashSet::new();
@@ -4069,6 +4055,7 @@ mod tests {
         let windows_app_down = FrontWindowState {
             claude_running: false,
             codex_running: true,
+            detection_ok: true,
             ..Default::default()
         };
         let t2 = clear_stale_in_progress(vec![running_now], &windows_app_down);
@@ -4078,171 +4065,4 @@ mod tests {
         assert!(completed.contains("s1"));
     }
 
-    // ---------- notifications ----------
-
-    #[test]
-    fn collect_notification_transitions_waiting_notifies_once() {
-        let tracked = SessionSummary {
-            app_kind: SessionApp::Claude,
-            cli_session_id: None,
-            completed_preview: None,
-            completed_turns: None,
-            cwd: "/tmp/my-project".to_string(),
-            in_progress: true,
-            is_archived: false,
-            last_activity_at: now_ms().saturating_sub(31_000),
-            session_id: "s1".to_string(),
-            title: "Need input".to_string(),
-            user_preview: None,
-            assistant_preview: None,
-        };
-        let payload = notification_payload(
-            Some(tracked.clone()),
-            vec![tracked],
-            PetAnimationState::Waiting,
-            &[],
-        );
-        let mut last_notified = HashMap::new();
-        let previously_seen: HashSet<String> = vec!["s1".to_string()].into_iter().collect();
-
-        let first = collect_notification_transitions(
-            &payload,
-            &previously_seen,
-            &mut last_notified,
-            now_ms(),
-        );
-        assert_eq!(first.len(), 1, "waiting transition should notify once");
-        assert_eq!(first[0].session_id, "s1");
-        assert_eq!(first[0].state, PetAnimationState::Waiting);
-        assert_eq!(first[0].subtitle, "my-project · Claude");
-        assert_eq!(first[0].body, "입력이 필요합니다");
-        assert_eq!(last_notified.get("s1").map(String::as_str), Some("waiting"));
-
-        let second = collect_notification_transitions(
-            &payload,
-            &previously_seen,
-            &mut last_notified,
-            now_ms(),
-        );
-        assert!(
-            second.is_empty(),
-            "same waiting state on later ticks must not re-notify"
-        );
-    }
-
-    #[test]
-    fn collect_notification_transitions_first_observation_seeds_without_notification() {
-        let tracked = SessionSummary {
-            app_kind: SessionApp::Codex,
-            cli_session_id: None,
-            completed_preview: None,
-            completed_turns: None,
-            cwd: "/tmp/workspace-alpha".to_string(),
-            in_progress: true,
-            is_archived: false,
-            last_activity_at: now_ms().saturating_sub(31_000),
-            session_id: "s1".to_string(),
-            title: "Need input".to_string(),
-            user_preview: None,
-            assistant_preview: None,
-        };
-        let payload = notification_payload(
-            Some(tracked.clone()),
-            vec![tracked],
-            PetAnimationState::Waiting,
-            &[],
-        );
-        let mut last_notified = HashMap::new();
-        let previously_seen: HashSet<String> = HashSet::new();
-
-        let notifications = collect_notification_transitions(
-            &payload,
-            &previously_seen,
-            &mut last_notified,
-            now_ms(),
-        );
-
-        assert!(
-            notifications.is_empty(),
-            "first observation should seed state without startup spam"
-        );
-        assert_eq!(last_notified.get("s1").map(String::as_str), Some("waiting"));
-    }
-
-    #[test]
-    fn collect_notification_transitions_running_clears_and_reenables_waving() {
-        let completed = SessionSummary {
-            app_kind: SessionApp::Claude,
-            cli_session_id: None,
-            completed_preview: Some("Done".to_string()),
-            completed_turns: Some(1),
-            cwd: "/tmp/my-project".to_string(),
-            in_progress: false,
-            is_archived: false,
-            last_activity_at: now_ms(),
-            session_id: "s1".to_string(),
-            title: "Done".to_string(),
-            user_preview: None,
-            assistant_preview: Some("Done".to_string()),
-        };
-        let completed_payload = notification_payload(
-            Some(completed.clone()),
-            vec![completed.clone()],
-            PetAnimationState::Waving,
-            &["s1"],
-        );
-        let mut last_notified = HashMap::new();
-        let previously_seen: HashSet<String> = vec!["s1".to_string()].into_iter().collect();
-
-        let first = collect_notification_transitions(
-            &completed_payload,
-            &previously_seen,
-            &mut last_notified,
-            now_ms(),
-        );
-        assert_eq!(first.len(), 1, "waving transition should notify");
-        assert_eq!(first[0].state, PetAnimationState::Waving);
-        assert_eq!(first[0].body, "작업이 완료됐습니다");
-        assert_eq!(last_notified.get("s1").map(String::as_str), Some("waving"));
-
-        let running = SessionSummary {
-            in_progress: true,
-            last_activity_at: now_ms(),
-            completed_preview: None,
-            completed_turns: Some(1),
-            user_preview: Some("New task".to_string()),
-            assistant_preview: None,
-            ..completed.clone()
-        };
-        let running_payload = notification_payload(
-            Some(running.clone()),
-            vec![running],
-            PetAnimationState::Running,
-            &[],
-        );
-
-        let during_running = collect_notification_transitions(
-            &running_payload,
-            &previously_seen,
-            &mut last_notified,
-            now_ms(),
-        );
-        assert!(during_running.is_empty(), "running state itself must not notify");
-        assert!(
-            !last_notified.contains_key("s1"),
-            "running should clear prior notified state so the next completion can notify again"
-        );
-
-        let second = collect_notification_transitions(
-            &completed_payload,
-            &previously_seen,
-            &mut last_notified,
-            now_ms(),
-        );
-        assert_eq!(
-            second.len(),
-            1,
-            "after running clears the marker, the next waving transition must notify again"
-        );
-    }
 }

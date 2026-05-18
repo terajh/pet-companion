@@ -11,10 +11,12 @@ import type {
   SessionSummary,
 } from "./types";
 import {
-  dismissDecisionForVisualState,
+  dismissDecision,
   pickVisibleSessions,
   sessionVisualState,
 } from "./state";
+import { computeShouldExpand } from "./expand";
+import { useTypewriter } from "./typing";
 import "./App.css";
 
 const windowLabel = getCurrentWebviewWindow().label;
@@ -217,7 +219,7 @@ function stateLabel(state: PetAnimationState, language: "en" | "ko"): string {
 // `companion:update` whose config still reflects pre-spawn state.  After this
 // TTL we accept whatever the backend says, on the assumption that the spawn
 // either succeeded slowly or failed and the user has moved on.  Used for
-// both pet-override and pet-scale reconciliation.
+// all optimistic sidechannel intent reconciliation.
 const PENDING_INTENT_TTL_MS = 5000;
 // Pet-scale comparisons use this epsilon — slider step is 0.1 so anything
 // within 1e-3 is effectively the same value.  Avoids floating-point near-miss
@@ -250,6 +252,10 @@ function usePayload() {
   // 1.0 before the spawn's eventual update lands.  Reconcile here just
   // like the override case.
   const pendingScaleRef = useRef<{ scale: number; ts: number } | null>(null);
+  const pendingDismissRef = useRef<Map<string, number>>(new Map());
+  const pendingWatchRef = useRef<
+    { watchClaude: boolean; watchCodex: boolean; ts: number } | null
+  >(null);
 
   useEffect(() => {
     let mounted = true;
@@ -305,6 +311,56 @@ function usePayload() {
         }
       }
 
+      const pendingWatch = pendingWatchRef.current;
+      if (pendingWatch) {
+        const age = Date.now() - pendingWatch.ts;
+        if (
+          incoming.config.watchClaude === pendingWatch.watchClaude &&
+          incoming.config.watchCodex === pendingWatch.watchCodex
+        ) {
+          pendingWatchRef.current = null;
+        } else if (age > PENDING_INTENT_TTL_MS) {
+          pendingWatchRef.current = null;
+        } else {
+          patched = {
+            ...patched,
+            config: {
+              ...patched.config,
+              watchClaude: pendingWatch.watchClaude,
+              watchCodex: pendingWatch.watchCodex,
+            },
+          };
+        }
+      }
+
+      const pendingDismissMap = pendingDismissRef.current;
+      if (pendingDismissMap.size > 0) {
+        const incomingDismissed = new Set(patched.overlay.dismissedSessionIds);
+        const mergedDismissed = [...incomingDismissed];
+        const incomingCompleted = new Set(patched.overlay.completedRuntimeSessionIds);
+        const now = Date.now();
+        for (const [sid, ts] of [...pendingDismissMap.entries()]) {
+          if (incomingDismissed.has(sid)) {
+            pendingDismissMap.delete(sid);
+            continue;
+          }
+          if (now - ts > PENDING_INTENT_TTL_MS) {
+            pendingDismissMap.delete(sid);
+            continue;
+          }
+          mergedDismissed.push(sid);
+          incomingCompleted.delete(sid);
+        }
+        patched = {
+          ...patched,
+          overlay: {
+            ...patched.overlay,
+            dismissedSessionIds: mergedDismissed,
+            completedRuntimeSessionIds: [...incomingCompleted],
+          },
+        };
+      }
+
       setPayload(patched);
     });
 
@@ -353,11 +409,50 @@ function usePayload() {
       },
     );
 
+    const unlistenWatch = listen<{ watchClaude: boolean; watchCodex: boolean }>(
+      "companion:watch_apps",
+      (event) => {
+        const next = event.payload;
+        pendingWatchRef.current = { ...next, ts: Date.now() };
+        setPayload((prev) =>
+          prev.config.watchClaude === next.watchClaude &&
+          prev.config.watchCodex === next.watchCodex
+            ? prev
+            : { ...prev, config: { ...prev.config, ...next } },
+        );
+      },
+    );
+
+    const unlistenDismiss = listen<{ sessionId: string }>(
+      "companion:dismiss",
+      (event) => {
+        if (!mounted) return;
+        const { sessionId } = event.payload;
+        pendingDismissRef.current.set(sessionId, Date.now());
+        setPayload((prev) => {
+          if (!prev) return prev;
+          if (prev.overlay.dismissedSessionIds.includes(sessionId)) return prev;
+          return {
+            ...prev,
+            overlay: {
+              ...prev.overlay,
+              dismissedSessionIds: [...prev.overlay.dismissedSessionIds, sessionId],
+              completedRuntimeSessionIds: prev.overlay.completedRuntimeSessionIds.filter(
+                (id) => id !== sessionId,
+              ),
+            },
+          };
+        });
+      },
+    );
+
     return () => {
       mounted = false;
       unlistenUpdate.then((fn) => fn()).catch(() => {});
       unlistenScale.then((fn) => fn()).catch(() => {});
       unlistenOverride.then((fn) => fn()).catch(() => {});
+      unlistenWatch.then((fn) => fn()).catch(() => {});
+      unlistenDismiss.then((fn) => fn()).catch(() => {});
     };
   }, []);
 
@@ -584,23 +679,21 @@ function projectLabel(cwd: string | null | undefined): string | null {
 function OverlayCard({
   onActivate,
   session,
-  state,
   preview,
   strings,
-  language,
   isActive,
 }: {
   onActivate: () => void;
   session: SessionSummary;
-  state: PetAnimationState;
   preview: string | null;
   strings: Messages;
-  language: "en" | "ko";
   isActive: boolean;
 }) {
-  const status = stateLabel(state, language);
   const badge = appBadge(session.appKind, strings);
   const project = projectLabel(session.cwd);
+  // Typewriter animation on the preview line only — header (badge / project /
+  // title) renders instantly.  Restarts whenever the preview text changes.
+  const typedPreview = useTypewriter(preview, 25);
 
   return (
     <button
@@ -608,24 +701,20 @@ function OverlayCard({
       onClick={onActivate}
       type="button"
     >
-      <span className="overlay-card__row">
+      <span className="overlay-card__header">
         <span className={`overlay-card__badge is-${session.appKind}`}>{badge}</span>
-        <span className={`overlay-card__status is-${state}`}>
-          <span className="overlay-card__status-dot" />
-          <span>{status}</span>
+        {project ? (
+          <span className="overlay-card__project" title={session.cwd}>
+            {project}
+          </span>
+        ) : null}
+        <span className="overlay-card__title" title={session.title}>
+          {session.title}
         </span>
-      </span>
-      {project ? (
-        <span className="overlay-card__project" title={session.cwd}>
-          {project}
-        </span>
-      ) : null}
-      <span className="overlay-card__title" title={session.title}>
-        {session.title}
       </span>
       {preview ? (
         <span className="overlay-card__preview" title={preview}>
-          {preview}
+          {typedPreview}
         </span>
       ) : null}
     </button>
@@ -660,13 +749,11 @@ function OverlayCardStack({
           <OverlayCard
             key={session.sessionId}
             isActive={session.sessionId === activeId}
-            language={payload.config.language}
             onActivate={() =>
               onActivateSession(session.sessionId, session.appKind, visualState)
             }
             preview={sessionPreview(session, payload)}
             session={session}
-            state={visualState}
             strings={strings}
           />
         );
@@ -854,6 +941,26 @@ function OverlayApp() {
     }
   }, [payload.overlay.pet.id]);
 
+  // Auto-expand the card stack when a session enters waiting/waving while
+  // the user had it collapsed.  We compare the previous tick's visualState
+  // map with the current one; any new transition into waiting or waving
+  // flips `collapsed` back to false.  On first mount `prev` is empty and
+  // `computeShouldExpand` returns false (seed-only), so we never auto-expand
+  // at startup.  After a user manually collapses, the next fresh transition
+  // re-expands — they can collapse again to dismiss.
+  const prevVisualStatesRef = useRef<Map<string, PetAnimationState>>(new Map());
+  useEffect(() => {
+    const visible = pickVisibleSessions(payload);
+    const curr = new Map<string, PetAnimationState>();
+    for (const session of visible) {
+      curr.set(session.sessionId, sessionVisualState(session, payload));
+    }
+    if (computeShouldExpand(prevVisualStatesRef.current, curr)) {
+      setCollapsed(false);
+    }
+    prevVisualStatesRef.current = curr;
+  }, [payload]);
+
   const handleActivateSession = async (
     sessionId?: string,
     appKind?: SessionAppKind,
@@ -861,10 +968,17 @@ function OverlayApp() {
   ) => {
     try {
       if (sessionId && appKind) {
-        // Dismiss-on-click policy (v0.1.30): decided by VISUAL state, not by
-        // the backend's in_progress flag.  See `dismissDecisionForVisualState`
-        // for the full rationale and edge cases (Claude B-T1-R1 quirk, etc.).
-        const dismiss = dismissDecisionForVisualState(visualState ?? "idle");
+        // Dismiss-on-click policy (v0.1.40): require both a visually "done"
+        // state AND backend completed-runtime membership so quiet active
+        // sessions do not get hidden by an optimistic frontend guess.
+        const completedRuntime = new Set(
+          payload.overlay.completedRuntimeSessionIds,
+        );
+        const dismiss = dismissDecision(
+          visualState ?? "idle",
+          completedRuntime,
+          sessionId,
+        );
         await call("cmd_focus_session_by_id", {
           input: { sessionId, appKind, dismiss },
         });

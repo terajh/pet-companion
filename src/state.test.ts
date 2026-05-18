@@ -8,8 +8,7 @@ import type {
 } from "./types";
 import {
   MAX_VISIBLE_CARDS,
-  RECENT_ACTIVITY_WINDOW_MS,
-  dismissDecisionForVisualState,
+  dismissDecision,
   pickVisibleSessions,
   sessionVisualState,
   type VisibilityClock,
@@ -140,21 +139,22 @@ describe("pickVisibleSessions — completion regression (the v0.1.30 bug)", () =
 });
 
 describe("pickVisibleSessions — active session policy", () => {
-  it("always shows the active session even when in_progress is false and not in completedRuntime", () => {
+  it("hides the active session when it is neither in progress nor runtime-completed", () => {
     const session = makeSession({
       sessionId: "s-active",
       inProgress: false,
-      lastActivityAt: NOW - 7 * 60 * 60 * 1000, // older than the 6h window
+      lastActivityAt: NOW - 1_000,
     });
     const overlay = makeOverlay({
       sessions: [session],
       activeSession: session,
       completedRuntimeSessionIds: [],
+      effectiveState: "idle",
     });
 
     const visible = pickVisibleSessions(makePayload(overlay), fixedClock);
 
-    expect(visible.map((s) => s.sessionId)).toEqual(["s-active"]);
+    expect(visible).toHaveLength(0);
   });
 
   it("hides the active session once it is dismissed", () => {
@@ -172,24 +172,20 @@ describe("pickVisibleSessions — active session policy", () => {
 });
 
 describe("pickVisibleSessions — in-progress / dismissed precedence", () => {
-  it("re-shows a previously dismissed session once in_progress flips back to true", () => {
-    // CLAUDE.md policy: only a false→true in_progress transition unblocks a
-    // dismissed card.  At the visible-list level this just means an
-    // in-progress session always wins over the dismissed flag.
+  it("hides dismissed sessions even when in_progress is true", () => {
     const session = makeSession({
       sessionId: "s-revived",
       inProgress: true,
+      lastActivityAt: NOW - 1_000,
     });
     const overlay = makeOverlay({
       sessions: [session],
-      // The dismissed_sessions retain pass in the backend would clear this,
-      // but defensively the frontend should also surface it.
       dismissedSessionIds: ["s-revived"],
     });
 
     const visible = pickVisibleSessions(makePayload(overlay), fixedClock);
 
-    expect(visible.map((s) => s.sessionId)).toContain("s-revived");
+    expect(visible).toHaveLength(0);
   });
 
   it("hides dismissed sessions that are NOT in progress", () => {
@@ -207,7 +203,7 @@ describe("pickVisibleSessions — in-progress / dismissed precedence", () => {
   });
 });
 
-describe("pickVisibleSessions — archived & recency policy", () => {
+describe("pickVisibleSessions — archived & visual-state policy", () => {
   it("never shows archived sessions", () => {
     const session = makeSession({
       sessionId: "s-archived",
@@ -219,22 +215,22 @@ describe("pickVisibleSessions — archived & recency policy", () => {
     expect(pickVisibleSessions(makePayload(overlay), fixedClock)).toHaveLength(0);
   });
 
-  it("shows recently-active sessions within RECENT_ACTIVITY_WINDOW_MS", () => {
+  it("keeps waiting sessions visible while in_progress stays true", () => {
     const session = makeSession({
-      sessionId: "s-recent",
-      inProgress: false,
-      lastActivityAt: NOW - (RECENT_ACTIVITY_WINDOW_MS - 1_000),
+      sessionId: "s-waiting",
+      inProgress: true,
+      lastActivityAt: NOW - 31_000,
     });
     const overlay = makeOverlay({ sessions: [session] });
 
     expect(pickVisibleSessions(makePayload(overlay), fixedClock)).toHaveLength(1);
   });
 
-  it("hides sessions older than RECENT_ACTIVITY_WINDOW_MS", () => {
+  it("hides idle sessions even when they were recently active within 6 hours", () => {
     const session = makeSession({
-      sessionId: "s-stale",
+      sessionId: "s-idle",
       inProgress: false,
-      lastActivityAt: NOW - (RECENT_ACTIVITY_WINDOW_MS + 1_000),
+      lastActivityAt: NOW - 60_000,
     });
     const overlay = makeOverlay({ sessions: [session] });
 
@@ -243,7 +239,7 @@ describe("pickVisibleSessions — archived & recency policy", () => {
 });
 
 describe("pickVisibleSessions — ordering & cap", () => {
-  it("sorts in-progress sessions before non-in-progress, then by lastActivityAt desc", () => {
+  it("sorts running sessions before waving sessions, then by lastActivityAt desc", () => {
     const sessions: SessionSummary[] = [
       makeSession({
         sessionId: "s-old-running",
@@ -372,22 +368,39 @@ describe("sessionVisualState", () => {
   });
 });
 
-describe("dismissDecisionForVisualState — click policy (v0.1.30)", () => {
-  const cases: ReadonlyArray<[PetAnimationState, boolean]> = [
-    ["running", false],
-    ["waiting", false],
-    // Everything the user perceives as "done" must dismiss on click:
-    ["waving", true],
-    ["idle", true],
-    ["sleeping", true],
-    ["jumping", true],
-    ["review", true],
-    ["failed", true],
+describe("dismissDecision — click policy (v0.1.40)", () => {
+  it("returns true for idle cards backed by completedRuntime", () => {
+    expect(dismissDecision("idle", new Set(["s-done"]), "s-done")).toBe(true);
+  });
+
+  it("returns false for quiet idle cards without completedRuntime membership", () => {
+    expect(dismissDecision("idle", new Set<string>(), "s-active")).toBe(false);
+  });
+
+  it("returns false for running cards regardless of completedRuntime membership", () => {
+    expect(dismissDecision("running", new Set(["s-running"]), "s-running")).toBe(
+      false,
+    );
+  });
+
+  const cases: ReadonlyArray<
+    [state: PetAnimationState, completedRuntime: string[], sessionId: string, expected: boolean]
+  > = [
+    ["running", [], "s-running-no-runtime", false],
+    ["waiting", ["s-waiting"], "s-waiting", false],
+    ["waiting", [], "s-waiting-no-runtime", false],
+    ["waving", ["s-waving"], "s-waving", true],
+    ["sleeping", ["s-sleeping"], "s-sleeping", true],
+    ["jumping", ["s-jumping"], "s-jumping", true],
+    ["review", ["s-review"], "s-review", true],
+    ["failed", ["s-failed"], "s-failed", true],
   ];
 
-  for (const [state, expected] of cases) {
-    it(`returns ${expected} for visualState='${state}'`, () => {
-      expect(dismissDecisionForVisualState(state)).toBe(expected);
+  for (const [state, completedRuntime, sessionId, expected] of cases) {
+    it(`returns ${expected} for visualState='${state}' with completedRuntime=${completedRuntime.length > 0}`, () => {
+      expect(
+        dismissDecision(state, new Set(completedRuntime), sessionId),
+      ).toBe(expected);
     });
   }
 });
@@ -471,5 +484,57 @@ describe("pickVisibleSessions — watch toggles per app", () => {
     );
 
     expect(visible).toHaveLength(0);
+  });
+
+  it("keeps active in_progress session visible regardless of effectiveState waiting/idle/jumping", () => {
+    const states: PetAnimationState[] = ["waiting", "idle", "jumping"];
+    for (const effective of states) {
+      const session = makeSession({
+        sessionId: "s-active",
+        inProgress: true,
+        lastActivityAt: NOW - 60_000,
+      });
+      const overlay = makeOverlay({
+        sessions: [session],
+        activeSession: session,
+        effectiveState: effective,
+      });
+      const payload = makePayload(overlay);
+      const visible = pickVisibleSessions(payload, fixedClock);
+      expect(visible, `effective=${effective}`).toHaveLength(1);
+      expect(visible[0].sessionId).toBe("s-active");
+    }
+  });
+
+  it("keeps non-active in_progress session visible even if lastActivityAt is old", () => {
+    const session = makeSession({
+      sessionId: "s-bg",
+      inProgress: true,
+      lastActivityAt: NOW - 5 * 60_000,
+    });
+    const overlay = makeOverlay({ sessions: [session] });
+    const payload = makePayload(overlay);
+    expect(pickVisibleSessions(payload, fixedClock)).toHaveLength(1);
+  });
+
+  it("hides non-in_progress session that is not in completedRuntime", () => {
+    const session = makeSession({
+      sessionId: "s-cold",
+      inProgress: false,
+      lastActivityAt: NOW - 1_000,
+    });
+    const overlay = makeOverlay({ sessions: [session] });
+    const payload = makePayload(overlay);
+    expect(pickVisibleSessions(payload, fixedClock)).toHaveLength(0);
+  });
+
+  it("shows non-in_progress session if completedRuntimeSessionIds includes it", () => {
+    const session = makeSession({ sessionId: "s-done", inProgress: false });
+    const overlay = makeOverlay({
+      sessions: [session],
+      completedRuntimeSessionIds: ["s-done"],
+    });
+    const payload = makePayload(overlay);
+    expect(pickVisibleSessions(payload, fixedClock)).toHaveLength(1);
   });
 });
