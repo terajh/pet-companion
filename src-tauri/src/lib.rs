@@ -195,10 +195,15 @@ struct PersistedConfig {
     watch_claude: bool,
     #[serde(default = "default_watch_app")]
     watch_codex: bool,
-    // Persists the user's "hide pet" choice across app restarts.  When
-    // true the overlay window is hidden on launch; toggled via the pet
-    // right-click menu, tray menu, or tray icon click.
-    #[serde(default)]
+    // Session-scoped hide state — intentionally NOT persisted.  v0.1.36
+    // persisted this across restarts, but the combination of "no obvious
+    // restore UI when the pet is hidden" + "stale true sticks forever"
+    // left users stranded with an invisible pet after upgrades.  Keeping
+    // the field in memory so cmd_set_pet_hidden / tray toggles still work,
+    // and `#[serde(skip)]` so it never leaks to disk: existing config.json
+    // entries with petHidden=true are ignored on load, and the key is
+    // dropped on the next persist.
+    #[serde(skip)]
     pet_hidden: bool,
 }
 
@@ -602,10 +607,6 @@ fn apply_pet_hidden(app: &AppHandle, hidden: bool) {
         {
             let mut model = state.model.lock().await;
             model.config.pet_hidden = hidden;
-            if let Err(err) = persist_config(&state.config_path, &model.config) {
-                eprintln!("[pet_hidden] persist_config failed: {}", err);
-                return;
-            }
         }
         if let Err(err) = refresh_and_emit(&app_clone, &state).await {
             eprintln!("[pet_hidden] refresh_and_emit failed: {}", err);
@@ -1461,20 +1462,12 @@ pub fn run() {
             build_tray(app)?;
             position_overlay_at_startup(app);
 
-            // Restore the user's persisted hide state.  If they explicitly
-            // hid the pet via the right-click menu or tray, keep it hidden
-            // across restarts (CompanionConfig.pet_hidden).
-            let pet_hidden = {
-                let state = app.state::<AppState>();
-                let model = state.model.blocking_lock();
-                model.config.pet_hidden
-            };
+            // Always start with the overlay visible.  pet_hidden is
+            // session-scoped (see PersistedConfig comment) so launch state
+            // is deterministically "visible" regardless of what the
+            // previous session left behind.
             if let Some(window) = app.get_webview_window(OVERLAY_WINDOW_LABEL) {
-                let _ = if pet_hidden {
-                    window.hide()
-                } else {
-                    window.show()
-                };
+                let _ = window.show();
             }
 
             // Lift overlay window level above the menu bar plane.  One-shot,
