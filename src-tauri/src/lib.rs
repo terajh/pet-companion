@@ -14,7 +14,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use tauri::{
     menu::{MenuBuilder, MenuItemBuilder},
-    tray::{TrayIconBuilder, TrayIconEvent},
+    tray::{MouseButton, MouseButtonState, TrayIconBuilder, TrayIconEvent},
     ActivationPolicy, AppHandle, Emitter, LogicalPosition, Manager, State, WindowEvent,
 };
 use tauri_plugin_autostart::MacosLauncher;
@@ -1690,7 +1690,18 @@ fn build_tray(app: &mut tauri::App) -> tauri::Result<()> {
             _ => {}
         })
         .on_tray_icon_event(|tray, event| {
-            if let TrayIconEvent::Click { .. } = event {
+            // tray-icon 0.23.1 의 macOS 구현은 단일 클릭당 두 개의
+            // TrayIconEvent::Click 을 발사한다 (mouseDown 의 Down, mouseUp 의 Up).
+            // 두 이벤트 모두에 반응하면 apply_pet_hidden 이 두 번 호출되어
+            // 한 번의 클릭으로 토글이 두 번 일어나고 사용자 입장에서 visibility 가
+            // 깜빡인 뒤 원복된다. Left + Up 으로 좁혀 single-click 시맨틱을 보장한다.
+            // 우클릭(Right) 은 메뉴가 자동으로 처리하므로 핸들러가 반응할 필요 없다.
+            if let TrayIconEvent::Click {
+                button: MouseButton::Left,
+                button_state: MouseButtonState::Up,
+                ..
+            } = event
+            {
                 let app = tray.app_handle();
                 let currently_visible = app
                     .get_webview_window(OVERLAY_WINDOW_LABEL)
