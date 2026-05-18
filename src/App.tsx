@@ -638,19 +638,15 @@ function normalizeText(text: string): string {
   return text.trim().toLowerCase().replace(/\s+/g, " ");
 }
 
-function sessionPreview(
-  session: SessionSummary,
-  payload: AppPayload,
-): string | null {
-  let candidate: string | null;
-
-  if (session.sessionId === payload.overlay.activeSession?.sessionId) {
-    candidate = payload.overlay.messagePreview;
-  } else if (session.inProgress) {
-    candidate = session.userPreview ?? null;
-  } else {
-    candidate = session.assistantPreview ?? session.completedPreview ?? null;
-  }
+function sessionPreview(session: SessionSummary): string | null {
+  // Always surface the most recent assistant turn — user messages are
+  // intentionally never shown in the card description.  Earlier versions
+  // showed `userPreview` for in-progress sessions and `overlay.messagePreview`
+  // for the active one, but those paths leaked the user's own prompts into
+  // the card, which was confusing ("나는 방금 뭘 물어봤더라" 가 description
+  // 에 그대로 박힘).  Falling back to `completedPreview` covers Codex sessions
+  // where `task_complete.last_agent_message` is the last useful payload.
+  const candidate = session.assistantPreview ?? session.completedPreview ?? null;
 
   if (candidate !== null && normalizeText(candidate) === normalizeText(session.title)) {
     return null;
@@ -661,17 +657,28 @@ function sessionPreview(
 
 /**
  * Derive a short project label from a session's `cwd`.
- * Uses the trailing path segment (basename) so the user can tell at a glance
- * which project the session was opened against.
+ *
+ * When the session is running inside a Claude Code worktree
+ * (`.../<project>/.claude/worktrees/<ephemeral-name>`), surface the parent
+ * project's basename instead of the worktree id — the worktree id is noisy
+ * (e.g. `charming-antonelli-575ea2`) and changes per task, while the project
+ * name is what the user actually recognizes.  Otherwise fall back to the
+ * trailing path segment.
  *
  * Examples:
- *   "/Users/carter.p/Dev/claude/works/claude-pet-companion" -> "claude-pet-companion"
+ *   "/Users/x/Dev/kakao/pet-companion" -> "pet-companion"
+ *   "/Users/x/Dev/kakao/pet-companion/.claude/worktrees/charming-antonelli-575ea2"
+ *     -> "pet-companion"
  *   "/Users/carter.p" -> "carter.p"
  *   ""                -> null
  */
 function projectLabel(cwd: string | null | undefined): string | null {
   if (!cwd) return null;
-  const segments = cwd.split("/").filter((part) => part.length > 0);
+
+  const worktreeMatch = cwd.match(/^(.+?)\/\.claude\/worktrees\/[^/]+/);
+  const effectivePath = worktreeMatch?.[1] ?? cwd;
+
+  const segments = effectivePath.split("/").filter((part) => part.length > 0);
   if (segments.length === 0) return null;
   return segments[segments.length - 1] ?? null;
 }
@@ -752,7 +759,7 @@ function OverlayCardStack({
             onActivate={() =>
               onActivateSession(session.sessionId, session.appKind, visualState)
             }
-            preview={sessionPreview(session, payload)}
+            preview={sessionPreview(session)}
             session={session}
             strings={strings}
           />
