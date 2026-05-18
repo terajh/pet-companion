@@ -598,8 +598,65 @@ async fn cmd_set_watch_apps(
 /// "toggle" callbacks could resolve in either order and leave the window
 /// in a state opposite to the user's last click.
 fn apply_pet_hidden(app: &AppHandle, hidden: bool) {
+    // v0.1.43: when restoring visibility, validate the saved detached
+    // position is still on a connected monitor.  If the user dragged the
+    // pet onto a since-disconnected external display, or into an L-shaped
+    // multi-monitor logical-coord gap, `window.show()` alone would succeed
+    // silently and the pet would re-appear off-screen with no way for the
+    // user to find it (the tray toggle was their only escape — and they
+    // already used it).  Snap to safe_home_position before show() so the
+    // pet always reappears somewhere the user can actually see it.
+    let snap_to: Option<(i32, i32)> = if !hidden {
+        app.get_webview_window(OVERLAY_WINDOW_LABEL).and_then(|window| {
+            // Use the primary monitor's scale factor (NOT window.scale_factor)
+            // for the physical→logical conversion.  In mixed-DPI multi-monitor
+            // setups window.scale_factor flips when the window straddles a
+            // boundary; primary scale is stable and matches what
+            // safe_home_position / clamp_overlay_position assume.  See the
+            // v0.1.30 oscillation entry in CLAUDE.md.
+            let primary_scale = window
+                .primary_monitor()
+                .ok()
+                .flatten()
+                .map(|m| m.scale_factor())
+                .unwrap_or(1.0)
+                .max(1.0);
+            let (cx, cy) = match window.outer_position().ok() {
+                Some(p) => (
+                    (p.x as f64 / primary_scale).round() as i32,
+                    (p.y as f64 / primary_scale).round() as i32,
+                ),
+                None => return None,
+            };
+            if position_is_visible_on_monitor(&window, cx, cy) {
+                eprintln!(
+                    "[pet_hidden] show: saved position ({},{}) is on a visible monitor; keeping",
+                    cx, cy
+                );
+                None
+            } else {
+                let (sx, sy) = safe_home_position(&window);
+                let _ = window.set_position(LogicalPosition::new(sx, sy));
+                eprintln!(
+                    "[pet_hidden] show: saved position ({},{}) not on any visible monitor; snapping to safe_home ({},{})",
+                    cx, cy, sx, sy
+                );
+                Some((sx, sy))
+            }
+        })
+    } else {
+        None
+    };
+
     if let Some(window) = app.get_webview_window(OVERLAY_WINDOW_LABEL) {
-        let _ = if hidden { window.hide() } else { window.show() };
+        let was_visible = window.is_visible().ok().unwrap_or(false);
+        let res = if hidden { window.hide() } else { window.show() };
+        eprintln!(
+            "[pet_hidden] {} (was_visible={}, result={:?})",
+            if hidden { "hide" } else { "show" },
+            was_visible,
+            res.as_ref().err()
+        );
     }
     let app_clone = app.clone();
     tauri::async_runtime::spawn(async move {
@@ -607,6 +664,16 @@ fn apply_pet_hidden(app: &AppHandle, hidden: bool) {
         {
             let mut model = state.model.lock().await;
             model.config.pet_hidden = hidden;
+            // Persist the snapped position so subsequent refresh ticks
+            // and the next launch don't restore the bad position.
+            if let Some((sx, sy)) = snap_to {
+                if model.config.detached {
+                    model.config.detached_position = Some(SavedPosition { x: sx, y: sy });
+                    if let Err(err) = persist_config(&state.config_path, &model.config) {
+                        eprintln!("[pet_hidden] persist_config failed: {}", err);
+                    }
+                }
+            }
         }
         if let Err(err) = refresh_and_emit(&app_clone, &state).await {
             eprintln!("[pet_hidden] refresh_and_emit failed: {}", err);
@@ -1052,6 +1119,26 @@ fn configure_overlay_window_level(app: &tauri::AppHandle) {
             let _: () = msg_send![ns_window, setLevel: 25_i64];
             let after: i64 = msg_send![ns_window, level];
             eprintln!("[level] NSWindow level {} -> {}", before, after);
+
+            // v0.1.43: pin the overlay to every macOS Space.  Without
+            // canJoinAllSpaces, after the user hides the pet (tray click /
+            // right-click menu) then switches Spaces, the subsequent
+            // window.show() re-orders the window on whichever Space WindowServer
+            // last associated it with — often the *previous* Space — leaving
+            // the pet invisible on the user's current desktop and giving them
+            // no way to find it (since the tray click was their only escape
+            // hatch).  Stationary keeps Mission Control from re-grouping it.
+            //   NSWindowCollectionBehaviorCanJoinAllSpaces = 1 << 0 = 1
+            //   NSWindowCollectionBehaviorStationary      = 1 << 4 = 16
+            const ALL_SPACES_STATIONARY: u64 = (1 << 0) | (1 << 4);
+            let before_behavior: u64 = msg_send![ns_window, collectionBehavior];
+            let _: () =
+                msg_send![ns_window, setCollectionBehavior: ALL_SPACES_STATIONARY];
+            let after_behavior: u64 = msg_send![ns_window, collectionBehavior];
+            eprintln!(
+                "[level] NSWindow collectionBehavior 0x{:x} -> 0x{:x}",
+                before_behavior, after_behavior
+            );
             Ok(())
         }));
         match outcome {
@@ -3589,6 +3676,50 @@ fn logical_monitor_frame(monitor: &tauri::Monitor) -> (i32, i32, i32, i32) {
     let height = (size.height as f64 / scale).round() as i32;
 
     (x, y, width, height)
+}
+
+/// v0.1.43: validate that an overlay positioned at `(x, y)` actually overlaps
+/// a real connected monitor by at least MIN_VISIBLE_OVERLAP on both axes.
+/// The persisted `detachedPosition` can become invalid in three ways the
+/// existing `clamp_overlay_position` UNION-rect logic doesn't catch:
+///   1. The monitor the user last dragged the pet onto was disconnected
+///      between sessions.
+///   2. The L-shaped multi-monitor layout has logical-coord gaps the UNION
+///      rect happens to include (e.g. primary 1728×1117@0,0 + externals at
+///      (866,-1080) and (-1054,-1080) leave a gap at x<0 or x>1728 below y=0).
+///   3. macOS's frontmost-Space heuristic places `orderFront:` on a Space
+///      different from where the user dragged the pet, surfacing it on a
+///      monitor that's no longer in the foreground.
+///
+/// When this check fails on the show-pet path, the caller snaps to
+/// `safe_home_position()` instead of just `window.show()`-ing into the void.
+fn position_is_visible_on_monitor(window: &tauri::WebviewWindow, x: i32, y: i32) -> bool {
+    // 60 px gives roughly half the pet-box height of margin: enough that a
+    // user with any reasonable monitor arrangement can spot the overlay
+    // without zooming around all four corners of their desktops.
+    const MIN_VISIBLE_OVERLAP: i32 = 60;
+    let Ok(monitors) = window.available_monitors() else {
+        // No monitor info — trust the saved position rather than risk
+        // yanking a working pet on platforms with incomplete enumeration.
+        return true;
+    };
+    if monitors.is_empty() {
+        return true;
+    }
+    let overlay_left = x;
+    let overlay_top = y;
+    let overlay_right = x + OVERLAY_WIDTH;
+    let overlay_bottom = y + OVERLAY_HEIGHT;
+    monitors.iter().any(|monitor| {
+        let (mx, my, mw, mh) = logical_monitor_frame(monitor);
+        let mr = mx + mw;
+        let mb = my + mh;
+        let ox = overlay_left.max(mx);
+        let oy = overlay_top.max(my);
+        let or = overlay_right.min(mr);
+        let ob = overlay_bottom.min(mb);
+        (or - ox) >= MIN_VISIBLE_OVERLAP && (ob - oy) >= MIN_VISIBLE_OVERLAP
+    })
 }
 
 fn visit_matching_files(
