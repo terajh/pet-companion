@@ -1,59 +1,113 @@
-# Claude Pet Companion
+<p align="center">
+  <img src="assets/hero.png" alt="Pet Companion" width="820">
+</p>
 
-macOS menu bar companion that renders a Codex-compatible desktop pet and maps it to local Claude Desktop session activity.
+<h1 align="center">Pet Companion</h1>
 
-## Stack
+<p align="center">A macOS menu-bar companion that follows your Claude Desktop and Codex sessions.</p>
 
-- Tauri 2
-- React 19
-- TypeScript
-- Vite
-- Rust
+<p align="center">
+  <img alt="Platform" src="https://img.shields.io/badge/platform-macOS%2013%2B-lightgrey">
+  <img alt="Tauri" src="https://img.shields.io/badge/Tauri-2-FFC131">
+  <img alt="React" src="https://img.shields.io/badge/React-19-61DAFB">
+  <img alt="TypeScript" src="https://img.shields.io/badge/TypeScript-5-3178C6">
+  <img alt="Version" src="https://img.shields.io/badge/version-0.1.38-blue">
+  <img alt="License" src="https://img.shields.io/badge/license-MIT-green">
+</p>
 
-## What it does
+---
 
-- Reads custom pets directly from `~/.codex/pets`
-- Follows the currently selected Codex custom pet from `~/.codex/.codex-global-state.json`
-- Falls back to `bori` when Codex has no active custom pet
-- Tracks local Claude Desktop sessions from:
-  - `~/Library/Application Support/Claude/claude-code-sessions`
-- Anchors to the active Claude window when permission is available
-- Falls back to detached overlay mode when Accessibility is not granted
-- Hides the session card while Claude is focused
-- Replays a completion animation when `completedTurns` increases
+**Pet Companion** sits in the macOS menu bar and renders a Codex-compatible desktop pet that mirrors the live state of your Claude Desktop and Codex sessions. Multi-session cards float above any app so you never miss when an AI is waiting on you. Click a card to jump straight to that session — drag the pet to detach, double-click to re-anchor.
 
-## Development
+## ✨ Features
+
+- 🐾 **Animated desktop pet** with five states: `idle / running / waiting / waving / jumping`
+- 🪟 **Multi-session cards** that float above any app and follow your active window
+- 🎯 **Tracks both Claude Desktop & Codex** simultaneously — each app monitored independently
+- 🔔 **Native macOS notifications** on state transitions (`waiting` / `waving`)
+- 🖱 **One-click focus** — click a card to jump to the matching Claude or Codex window
+- 🪄 **Custom Codex pets** loaded directly from `~/.codex/pets`
+- 📌 **Drag to detach** or double-click to re-anchor to the active window
+- ⚙️ **Per-app watch toggles**, pet size slider, and right-click hide
+
+## 📸 Screenshots
+
+<table>
+  <tr>
+    <td align="center">
+      <img src="assets/screenshots/beginscreen.png" width="380" alt="Idle pet on the menu bar"><br>
+      <sub><b>Idle pet anchored to the menu bar</b></sub>
+    </td>
+    <td align="center">
+      <img src="assets/screenshots/startscreen.png" width="380" alt="Running session with floating card"><br>
+      <sub><b>Running session with a floating card</b></sub>
+    </td>
+  </tr>
+</table>
+
+## 🏗 Architecture
+
+Pet Companion is built on **Tauri 2** with a Rust back-end and a React 19 + TypeScript front-end. A transparent always-on-top overlay renders the pet and session cards, while a Rust service watches `~/.claude/projects` and `~/.codex/sessions` via FSEvents for instant state updates.
+
+<p align="center">
+  <img src="docs/diagrams/pipeline.png" alt="Pipeline diagram" width="720">
+</p>
+
+## 🚀 Requirements
+
+- **macOS 13** (Ventura) or later
+- **Accessibility permission** _(recommended)_ — enables window-anchoring and one-click focus via AppleScript
+- **Notifications permission** _(optional)_ — surfaces state-change alerts when sessions go `waiting` or `waving`
+
+## 📦 Installation
+
+### Pre-built bundle
+
+Grab the latest `Pet Companion.app` from the [Releases](https://github.com/terajh/pet-companion/releases) page and drop it into `/Applications`.
+
+### From source
 
 ```bash
 pnpm install
-pnpm tauri dev
-```
-
-## Build
-
-```bash
-pnpm build
 pnpm tauri build --debug
 ```
 
-Debug app bundle:
+The debug bundle is written to:
 
-`src-tauri/target/debug/bundle/macos/Claude Pet Companion.app`
-
-## Project layout
-
-```text
-claude-pet-companion/
-├── src/
-│   ├── App.tsx
-│   ├── App.css
-│   ├── main.tsx
-│   └── types.ts
-└── src-tauri/
-    ├── Cargo.toml
-    ├── Info.plist
-    ├── tauri.conf.json
-    └── src/
-        ├── lib.rs
-        └── main.rs
 ```
+src-tauri/target/debug/bundle/macos/Pet Companion.app
+```
+
+## 🛠 Development
+
+```bash
+pnpm install
+pnpm tauri dev                                       # run the app with hot reload
+pnpm test                                            # vitest unit tests
+cargo check --manifest-path src-tauri/Cargo.toml     # Rust type-check
+```
+
+## ⚙️ Configuration
+
+Open the **Settings** window from the tray menu to adjust:
+
+| Option | Description |
+|--------|-------------|
+| **Pet size** | Scale the pet from `0.5×` to `2.0×` |
+| **Watch Claude / Watch Codex** | Toggle per-app session tracking independently |
+| **Pet override** | Pick any Codex custom pet under `~/.codex/pets`, or fall back to `bori` |
+
+Right-click the pet for the in-overlay shortcut to **Hide pet** — re-show it from the menu-bar tray icon.
+
+## 🗺 Roadmap
+
+- ✅ **macOS state-transition notifications** _(shipped in v0.1.38)_
+- 🟡 Pet collection & multi-slot UI
+- 🟢 Status-aware action hints on session cards
+- 🟢 Daily session statistics dashboard
+
+See [`docs/STRATEGY.md`](docs/STRATEGY.md) for the full competitive gap analysis and roadmap rationale.
+
+## 📄 License
+
+Released under the [MIT License](LICENSE).
