@@ -51,8 +51,8 @@ ZIP_PATH="$DIST_DIR/${ZIP_NAME}.zip"
 git add package.json src-tauri/tauri.conf.json src-tauri/Cargo.toml src-tauri/Cargo.lock
 git commit -m "release: v$VERSION" --allow-empty
 git tag "v$VERSION"
-git push origin "$(git rev-parse --abbrev-ref HEAD)"
-git push origin "v$VERSION"
+git push github "$(git rev-parse --abbrev-ref HEAD)"
+git push github "v$VERSION"
 echo "🏷️  태그 v$VERSION 푸시 완료"
 
 # ── 릴리즈 노트 ────────────────────────────────────
