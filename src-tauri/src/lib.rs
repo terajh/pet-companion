@@ -357,8 +357,10 @@ struct PetHiddenInput {
 }
 
 /// Payload for `FACING_EVENT`. `dragging=false` means the pet is no longer
-/// being dragged (frontend should drop the running override and reset
-/// horizontal flip). `facing_left=true` mirrors the sprite via `scaleX(-1)`.
+/// being dragged (frontend should drop the drag-direction state and return
+/// to `effectiveState`). `facing_left=true` selects the `running_left`
+/// sprite row directly; the canonical hatch-pet sheet ships row 1 =
+/// running-right and row 2 = running-left, so no CSS flip is needed.
 #[derive(Debug, Clone, Copy, Serialize)]
 #[serde(rename_all = "camelCase")]
 struct FacingPayload {
@@ -1323,9 +1325,10 @@ async fn cmd_finalize_drag_position(
     }
 
     // Emit a terminal facing event so the frontend drops its drag-only
-    // visual state (running override + scaleX(-1) mirror).  Send this
-    // immediately — same rationale as the lightweight side-channel events
-    // for pet_scale / pet_override: must not wait on the heavy model lock.
+    // visual state (running_left / running_right row override) and returns
+    // to effectiveState.  Send this immediately — same rationale as the
+    // lightweight side-channel events for pet_scale / pet_override: must
+    // not wait on the heavy model lock.
     let _ = app.emit(
         FACING_EVENT,
         FacingPayload {
