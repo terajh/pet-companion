@@ -87,11 +87,12 @@ impl Default for SessionApp {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-#[serde(rename_all = "lowercase")]
+#[serde(rename_all = "snake_case")]
 enum PetAnimationState {
     Idle,
-    Sleeping,
     Running,
+    RunningRight,
+    RunningLeft,
     Waiting,
     Waving,
     Jumping,
@@ -1986,15 +1987,6 @@ fn rebuild_payload(model: &mut RuntimeModel, config_path: &Path) -> Result<AppPa
     } else {
         map_base_state(base_state)
     };
-    // When the pet would otherwise be Idle and no session anywhere is
-    // running/waiting, swap to the Sleeping animation so the overlay looks
-    // peaceful instead of static.
-    let any_in_progress = sessions.iter().any(|s| s.in_progress);
-    let effective_state = if effective_state == PetAnimationState::Idle && !any_in_progress {
-        PetAnimationState::Sleeping
-    } else {
-        effective_state
-    };
     let owner_frontmost = active_session
         .as_ref()
         .map(|session| is_app_frontmost(&windows, session.app_kind))
@@ -3813,6 +3805,33 @@ mod tests {
     fn parse_process_names_handles_empty_stdout() {
         let (claude_running, codex_running) = parse_process_names("");
         assert_eq!((claude_running, codex_running), (false, false));
+    }
+
+    #[test]
+    fn pet_animation_state_running_right_serializes_as_snake_case() {
+        let json = serde_json::to_string(&PetAnimationState::RunningRight).unwrap();
+        assert_eq!(json, "\"running_right\"");
+    }
+
+    #[test]
+    fn pet_animation_state_running_left_serializes_as_snake_case() {
+        let json = serde_json::to_string(&PetAnimationState::RunningLeft).unwrap();
+        assert_eq!(json, "\"running_left\"");
+    }
+
+    #[test]
+    fn pet_animation_state_single_word_variants_stay_lowercase() {
+        // Regression guard: switching `rename_all` from "lowercase" to "snake_case"
+        // must NOT change how single-word variants are encoded.  Frontend type
+        // literals (`"idle"`, `"running"`, `"waving"`, ...) depend on these exact
+        // strings.
+        assert_eq!(serde_json::to_string(&PetAnimationState::Idle).unwrap(), "\"idle\"");
+        assert_eq!(serde_json::to_string(&PetAnimationState::Running).unwrap(), "\"running\"");
+        assert_eq!(serde_json::to_string(&PetAnimationState::Waiting).unwrap(), "\"waiting\"");
+        assert_eq!(serde_json::to_string(&PetAnimationState::Waving).unwrap(), "\"waving\"");
+        assert_eq!(serde_json::to_string(&PetAnimationState::Jumping).unwrap(), "\"jumping\"");
+        assert_eq!(serde_json::to_string(&PetAnimationState::Review).unwrap(), "\"review\"");
+        assert_eq!(serde_json::to_string(&PetAnimationState::Failed).unwrap(), "\"failed\"");
     }
 
     fn now_ms() -> u64 {
