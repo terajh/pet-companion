@@ -14,7 +14,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use tauri::{
     menu::{MenuBuilder, MenuItemBuilder},
-    tray::{MouseButton, MouseButtonState, TrayIconBuilder, TrayIconEvent},
+    tray::TrayIconBuilder,
     ActivationPolicy, AppHandle, Emitter, LogicalPosition, Manager, State, WindowEvent,
 };
 use tauri_plugin_autostart::MacosLauncher;
@@ -1700,15 +1700,6 @@ fn build_tray(app: &mut tauri::App) -> tauri::Result<()> {
         },
     )
     .build(app)?;
-    let attach_pet = MenuItemBuilder::with_id(
-        "attach_pet",
-        if is_korean {
-            "Claude에 다시 붙이기"
-        } else {
-            "Attach to Claude"
-        },
-    )
-    .build(app)?;
     let open_settings = MenuItemBuilder::with_id(
         "open_settings",
         if is_korean {
@@ -1721,7 +1712,7 @@ fn build_tray(app: &mut tauri::App) -> tauri::Result<()> {
     let quit =
         MenuItemBuilder::with_id("quit", if is_korean { "종료" } else { "Quit" }).build(app)?;
     let menu = MenuBuilder::new(app)
-        .items(&[&show_pet, &attach_pet, &open_settings])
+        .items(&[&show_pet, &open_settings])
         .separator()
         .items(&[&quit])
         .build()?;
@@ -1734,7 +1725,13 @@ fn build_tray(app: &mut tauri::App) -> tauri::Result<()> {
     let _tray = TrayIconBuilder::with_id(TRAY_ID)
         .icon(tray_icon)
         .menu(&menu)
-        .show_menu_on_left_click(false)
+        // 좌/우 클릭 모두 OS 가 자동으로 메뉴를 표시한다.  좌클릭이 펫
+        // visibility 를 직접 토글하던 경로(`on_tray_icon_event` 의
+        // Left+Up 매칭, v0.1.40)는 제거됨 — 트레이 클릭의 시맨틱을
+        // "메뉴 열기" 한 가지로 단일화해서 사용자가 메뉴를 보지 못한
+        // 채 펫을 잃는 디스커버리 위험을 차단한다.  메뉴의
+        // "Show / Hide Pet" 항목이 그 진입점을 대신한다.
+        .show_menu_on_left_click(true)
         .on_menu_event(|app, event| match event.id().as_ref() {
             "show_pet" => {
                 // Compute the next state synchronously from the current
@@ -1752,18 +1749,6 @@ fn build_tray(app: &mut tauri::App) -> tauri::Result<()> {
                     .unwrap_or(false);
                 apply_pet_hidden(app, currently_visible);
             }
-            "attach_pet" => {
-                let handle = app.clone();
-                tauri::async_runtime::spawn(async move {
-                    let state = handle.state::<AppState>();
-                    {
-                        let mut model = state.model.lock().await;
-                        model.config.detached = false;
-                        let _ = persist_config(&state.config_path, &model.config);
-                    }
-                    let _ = refresh_and_emit(&handle, &state).await;
-                });
-            }
             "open_settings" => {
                 if let Some(window) = app.get_webview_window(SETTINGS_WINDOW_LABEL) {
                     let _ = window.show();
@@ -1772,27 +1757,6 @@ fn build_tray(app: &mut tauri::App) -> tauri::Result<()> {
             }
             "quit" => app.exit(0),
             _ => {}
-        })
-        .on_tray_icon_event(|tray, event| {
-            // tray-icon 0.23.1 의 macOS 구현은 단일 클릭당 두 개의
-            // TrayIconEvent::Click 을 발사한다 (mouseDown 의 Down, mouseUp 의 Up).
-            // 두 이벤트 모두에 반응하면 apply_pet_hidden 이 두 번 호출되어
-            // 한 번의 클릭으로 토글이 두 번 일어나고 사용자 입장에서 visibility 가
-            // 깜빡인 뒤 원복된다. Left + Up 으로 좁혀 single-click 시맨틱을 보장한다.
-            // 우클릭(Right) 은 메뉴가 자동으로 처리하므로 핸들러가 반응할 필요 없다.
-            if let TrayIconEvent::Click {
-                button: MouseButton::Left,
-                button_state: MouseButtonState::Up,
-                ..
-            } = event
-            {
-                let app = tray.app_handle();
-                let currently_visible = app
-                    .get_webview_window(OVERLAY_WINDOW_LABEL)
-                    .and_then(|w| w.is_visible().ok())
-                    .unwrap_or(false);
-                apply_pet_hidden(app, currently_visible);
-            }
         })
         .build(app)?;
 
