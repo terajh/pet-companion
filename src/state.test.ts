@@ -390,7 +390,6 @@ describe("dismissDecision — click policy (v0.1.40)", () => {
     ["waiting", ["s-waiting"], "s-waiting", false],
     ["waiting", [], "s-waiting-no-runtime", false],
     ["waving", ["s-waving"], "s-waving", true],
-    ["sleeping", ["s-sleeping"], "s-sleeping", true],
     ["jumping", ["s-jumping"], "s-jumping", true],
     ["review", ["s-review"], "s-review", true],
     ["failed", ["s-failed"], "s-failed", true],

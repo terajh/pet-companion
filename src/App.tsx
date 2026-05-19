@@ -63,13 +63,14 @@ const STATE_ROWS: Record<
   { frames: number; fps: number; row: number }
 > = {
   idle: { row: 0, frames: 6, fps: 3 },
-  sleeping: { row: 1, frames: 6, fps: 2 },
-  running: { row: 7, frames: 6, fps: 7 },
-  waiting: { row: 6, frames: 6, fps: 2 },
+  running_right: { row: 1, frames: 8, fps: 8 },
+  running_left: { row: 2, frames: 8, fps: 8 },
   waving: { row: 3, frames: 4, fps: 6 },
   jumping: { row: 4, frames: 5, fps: 8 },
-  review: { row: 8, frames: 6, fps: 3 },
   failed: { row: 5, frames: 8, fps: 4 },
+  waiting: { row: 6, frames: 6, fps: 2 },
+  running: { row: 7, frames: 6, fps: 7 },
+  review: { row: 8, frames: 6, fps: 3 },
 };
 
 const SPRITE_WIDTH = 96;
@@ -196,7 +197,8 @@ function stateLabel(state: PetAnimationState, language: "en" | "ko"): string {
       jumping: "Updating",
       review: "Review",
       running: "In progress",
-      sleeping: "Sleeping",
+      running_left: "Running left",
+      running_right: "Running right",
       waiting: "Still working",
       waving: "Completed",
     },
@@ -206,7 +208,8 @@ function stateLabel(state: PetAnimationState, language: "en" | "ko"): string {
       jumping: "갱신 중",
       review: "검토",
       running: "진행 중",
-      sleeping: "자는 중",
+      running_left: "달리는 중 (좌)",
+      running_right: "달리는 중 (우)",
       waiting: "계속 진행 중",
       waving: "완료됨",
     },

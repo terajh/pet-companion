@@ -1,7 +1,8 @@
 export type PetAnimationState =
   | "idle"
-  | "sleeping"
   | "running"
+  | "running_right"
+  | "running_left"
   | "waiting"
   | "waving"
   | "jumping"
