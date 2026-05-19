@@ -562,12 +562,10 @@ function PetSprite({
   pet,
   state,
   onLoaded,
-  flipHorizontal = false,
 }: {
   pet: PetDescriptor;
   state: PetAnimationState;
   onLoaded?: () => void;
-  flipHorizontal?: boolean;
 }) {
   const frame = useAnimationFrameCount(state);
   const spec = STATE_ROWS[state];
@@ -626,10 +624,6 @@ function PetSprite({
         backgroundPosition: `calc(${-frame * SPRITE_WIDTH}px * var(--pet-scale, 1)) calc(${-spec.row * SPRITE_HEIGHT}px * var(--pet-scale, 1))`,
         width: `calc(${SPRITE_WIDTH}px * var(--pet-scale, 1))`,
         height: `calc(${SPRITE_HEIGHT}px * var(--pet-scale, 1))`,
-        // Horizontal mirror for left-facing during drag.  The sprite sheet
-        // only ships a single right-facing running row (row 7), so we flip
-        // the entire element with CSS instead of swapping rows.
-        transform: flipHorizontal ? "scaleX(-1)" : undefined,
       }}
       aria-label={`${pet.displayName} ${state}`}
       role="img"
@@ -1106,17 +1100,16 @@ function OverlayApp() {
         />
       ) : null}
       <div
-        className={`pet-shell is-${facing.isDragging ? "running" : payload.overlay.effectiveState}${spriteLoaded ? " is-loaded" : ""}`}
+        className={`pet-shell is-${facing.isDragging ? (facing.facingLeft ? "running_left" : "running_right") : payload.overlay.effectiveState}${spriteLoaded ? " is-loaded" : ""}`}
         onDoubleClick={() => call("cmd_reattach_overlay").catch(console.error)}
         onPointerDown={handlePointerDown}
         onPointerMove={handlePointerMove}
         onPointerUp={handlePointerUp}
       >
         <PetSprite
-          flipHorizontal={facing.isDragging && facing.facingLeft}
           onLoaded={() => setSpriteLoaded(true)}
           pet={payload.overlay.pet}
-          state={facing.isDragging ? "running" : payload.overlay.effectiveState}
+          state={facing.isDragging ? (facing.facingLeft ? "running_left" : "running_right") : payload.overlay.effectiveState}
         />
         <button
           className="pet-shell__collapse-btn"
