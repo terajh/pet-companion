@@ -1793,7 +1793,21 @@ fn compute_cards_below(app: &AppHandle) -> bool {
     let Some(window) = app.get_webview_window(OVERLAY_WINDOW_LABEL) else {
         return false;
     };
-    let scale = window.scale_factor().unwrap_or(1.0).max(1.0);
+    // Always convert physical pixels using the primary monitor's scale_factor.
+    // `window.scale_factor()` returns NSWindow.backingScaleFactor which flips
+    // (Retina 2.0 ↔ external 1.0) as the window crosses monitor boundaries,
+    // so using it here would make `pet_top_screen` oscillate at the boundary
+    // and the `cards_below` decision (and thus the visible card-stack
+    // position) would flicker between "above pet" and "left of pet" every
+    // refresh tick.  v0.1.30 invariant: positioning hot paths use primary
+    // scale only.
+    let scale = window
+        .primary_monitor()
+        .ok()
+        .flatten()
+        .map(|m| m.scale_factor())
+        .unwrap_or(1.0)
+        .max(1.0);
     let Ok(physical) = window.outer_position() else {
         return false;
     };
@@ -1805,12 +1819,7 @@ fn compute_cards_below(app: &AppHandle) -> bool {
     let Ok(monitors) = window.available_monitors() else {
         return false;
     };
-    let Ok(physical_x) = window
-        .outer_position()
-        .map(|p| (p.x as f64 / scale).round() as i32)
-    else {
-        return false;
-    };
+    let physical_x = (physical.x as f64 / scale).round() as i32;
     let pet_local_x = OVERLAY_WIDTH - PET_BOX_RIGHT - PET_BOX_WIDTH;
     let pet_cx = physical_x + pet_local_x + PET_BOX_WIDTH / 2;
     let pet_cy = pet_top_screen + PET_BOX_HEIGHT / 2;
