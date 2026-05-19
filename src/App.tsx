@@ -681,20 +681,25 @@ function projectLabel(cwd: string | null | undefined): string | null {
 }
 
 function OverlayCard({
-  onActivate,
-  session,
-  preview,
-  strings,
   isActive,
+  language,
+  onActivate,
+  preview,
+  session,
+  strings,
+  visualState,
 }: {
-  onActivate: () => void;
-  session: SessionSummary;
-  preview: string | null;
-  strings: Messages;
   isActive: boolean;
+  language: "en" | "ko";
+  onActivate: () => void;
+  preview: string | null;
+  session: SessionSummary;
+  strings: Messages;
+  visualState: PetAnimationState;
 }) {
   const badge = appBadge(session.appKind, strings);
   const project = projectLabel(session.cwd);
+  const statusText = stateLabel(visualState, language);
   // Typewriter animation on the preview line only — header (badge / project /
   // title) renders instantly.  Restarts whenever the preview text changes.
   const typedPreview = useTypewriter(preview, 25);
@@ -707,6 +712,13 @@ function OverlayCard({
     >
       <span className="overlay-card__header">
         <span className={`overlay-card__badge is-${session.appKind}`}>{badge}</span>
+        <span
+          className={`overlay-card__status is-${visualState}`}
+          title={statusText}
+        >
+          <span className="overlay-card__status-dot" />
+          {statusText}
+        </span>
         {project ? (
           <span className="overlay-card__project" title={session.cwd}>
             {project}
@@ -753,12 +765,14 @@ function OverlayCardStack({
           <OverlayCard
             key={session.sessionId}
             isActive={session.sessionId === activeId}
+            language={payload.config.language}
             onActivate={() =>
               onActivateSession(session.sessionId, session.appKind, visualState)
             }
             preview={sessionPreview(session)}
             session={session}
             strings={strings}
+            visualState={visualState}
           />
         );
       })}
