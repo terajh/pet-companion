@@ -30,20 +30,6 @@
 - 📌 **Drag to detach** or double-click to re-anchor to the active window
 - ⚙️ **Per-app watch toggles**, pet size slider, and right-click hide
 
-## 📸 Screenshots
-
-<table>
-  <tr>
-    <td align="center">
-      <img src="assets/screenshots/beginscreen.png" width="380" alt="Idle pet on the menu bar"><br>
-      <sub><b>Idle pet anchored to the menu bar</b></sub>
-    </td>
-    <td align="center">
-      <img src="assets/screenshots/startscreen.png" width="380" alt="Running session with floating card"><br>
-      <sub><b>Running session with a floating card</b></sub>
-    </td>
-  </tr>
-</table>
 
 ## 🏗 Architecture
 
