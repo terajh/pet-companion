@@ -102,6 +102,7 @@ const MESSAGES = {
     effectivePet: "Effective pet",
     focusApp: "Focus app",
     hidePet: "Hide Pet",
+    showPet: "Show Pet",
     language: "Language",
     manualPetOverride: "Manual pet override",
     noActiveSession: "No active session",
@@ -143,6 +144,7 @@ const MESSAGES = {
     effectivePet: "실제 사용 펫",
     focusApp: "앱 포커스",
     hidePet: "펫 숨기기",
+    showPet: "펫 보이기",
     language: "언어",
     manualPetOverride: "수동 펫 선택",
     noActiveSession: "활성 세션 없음",
@@ -783,14 +785,16 @@ function OverlayCardStack({
 function ContextMenu({
   menu,
   onClose,
-  onHidePet,
+  onTogglePet,
   onOpenSettings,
+  petHidden,
   strings,
 }: {
   menu: ContextMenuState;
   onClose: () => void;
-  onHidePet: () => void;
-  onOpenSettings: () => void;
+  onTogglePet: () => void;
+  onOpenSettings?: () => void;
+  petHidden: boolean;
   strings: Messages;
 }) {
   if (!menu) {
@@ -801,12 +805,14 @@ function ContextMenu({
     <>
       <div className="menu-backdrop" onClick={onClose} />
       <div className="context-menu" style={{ left: menu.x, top: menu.y }}>
-        <button className="context-menu__item" onClick={onHidePet} type="button">
-          {strings.hidePet}
+        <button className="context-menu__item" onClick={onTogglePet} type="button">
+          {petHidden ? strings.showPet : strings.hidePet}
         </button>
-        <button className="context-menu__item" onClick={onOpenSettings} type="button">
-          {strings.openSettings}
-        </button>
+        {onOpenSettings ? (
+          <button className="context-menu__item" onClick={onOpenSettings} type="button">
+            {strings.openSettings}
+          </button>
+        ) : null}
       </div>
     </>
   );
@@ -1145,14 +1151,17 @@ function OverlayApp() {
       <ContextMenu
         menu={menu}
         onClose={() => setMenu(null)}
-        onHidePet={() => {
+        onTogglePet={() => {
           setMenu(null);
-          call("cmd_set_pet_hidden", { input: { hidden: true } }).catch(console.error);
+          call("cmd_set_pet_hidden", {
+            input: { hidden: !payload.config.petHidden },
+          }).catch(console.error);
         }}
         onOpenSettings={() => {
           setMenu(null);
           call("cmd_show_settings").catch(console.error);
         }}
+        petHidden={payload.config.petHidden}
         strings={strings}
       />
     </div>
@@ -1178,6 +1187,7 @@ function SettingsApp() {
   const payload = usePayload();
   const [autostartEnabled, setAutostartEnabled] = useState(false);
   const [autostartError, setAutostartError] = useState<string | null>(null);
+  const [menu, setMenu] = useState<ContextMenuState>(null);
   // Slider drag-vs-payload-echo: the IPC round-trip for cmd_set_pet_scale
   // (lock + persist + emit + React rerender) is slow enough that a 60Hz drag
   // sees the controlled `value` lagging by a frame or two, which makes the
@@ -1251,7 +1261,26 @@ function SettingsApp() {
   };
 
   return (
-    <div className="settings-root" style={{ pointerEvents: "auto", userSelect: "text" }}>
+    <div
+      className="settings-root"
+      style={{ pointerEvents: "auto", userSelect: "text" }}
+      onContextMenu={(event) => {
+        event.preventDefault();
+        setMenu(clampMenuPosition(event.clientX, event.clientY));
+      }}
+    >
+      <ContextMenu
+        menu={menu}
+        onClose={() => setMenu(null)}
+        onTogglePet={() => {
+          setMenu(null);
+          call("cmd_set_pet_hidden", {
+            input: { hidden: !payload.config.petHidden },
+          }).catch(console.error);
+        }}
+        petHidden={payload.config.petHidden}
+        strings={strings}
+      />
       <header className="settings-header">
         <div>
           <h1>{strings.title}</h1>
