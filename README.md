@@ -31,14 +31,6 @@
 - ⚙️ **Per-app watch toggles**, pet size slider, and right-click hide
 
 
-## 🏗 Architecture
-
-Pet Companion is built on **Tauri 2** with a Rust back-end and a React 19 + TypeScript front-end. A transparent always-on-top overlay renders the pet and session cards, while a Rust service watches `~/.claude/projects` and `~/.codex/sessions` via FSEvents for instant state updates.
-
-<p align="center">
-  <img src="docs/diagrams/pipeline.png" alt="Pipeline diagram" width="720">
-</p>
-
 ## 🚀 Requirements
 
 - **macOS 13** (Ventura) or later
